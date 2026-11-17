@@ -463,32 +463,28 @@ fn finish_recording(app: &AppHandle) {
     let reason = rec.status().stop_reason;
     let result = rec.stop();
     let frames = result.frames;
-    // MP4 바로 저장 결과 알리기 (녹화 틀에도 보이게 먼저)
-    let mut direct_saved = false;
-    match &result.direct {
+    // 알릴 것들. 알림은 한 번에 하나만 보이므로 한 줄로 모아, 사용자가 보게 될 창이 뜬 뒤에 보낸다.
+    let mut notes: Vec<String> = vec![];
+    // MP4 바로 저장으로 만든 파일
+    let saved = match result.direct {
         Some(Ok(path)) => {
-            direct_saved = true;
-            // 소리에 문제가 있었으면 같은 알림에 함께 알린다 (알림은 한 번에 하나만 보인다)
-            let _ = app.emit(
-                "notice",
-                match &result.audio_warning {
-                    Some(w) => format!("MP4로 저장했습니다. {w}: {}", path.display()),
-                    None => format!("MP4로 저장했습니다: {}", path.display()),
-                },
-            );
-            if state.settings.lock().rec_direct_save_open_folder {
-                let _ = tauri_plugin_opener::reveal_item_in_dir(path);
-            }
+            // 소리에 문제가 있었으면 함께 알린다
+            notes.push(match &result.audio_warning {
+                Some(w) => format!("MP4로 저장했습니다. {w}: {}", path.display()),
+                None => format!("MP4로 저장했습니다: {}", path.display()),
+            });
+            Some(path)
         }
         Some(Err(e)) => {
-            let _ = app.emit("notice", e.clone());
+            notes.push(e);
+            None
         }
-        None => {}
-    }
+        None => None,
+    };
     if result.dropped {
-        let _ =
-            app.emit("notice", "메모리 한도에 닿아 편집 창에는 앞부분만 있습니다 (MP4에는 전부 저장됨)".to_string());
+        notes.push("메모리 한도에 닿아 편집 창에는 앞부분만 있습니다 (MP4에는 전부 저장됨)".into());
     }
+    notes.extend(reason.clone());
     if let Ok(w) = recorder_window(app) {
         let _ = w.set_resizable(true);
     }
@@ -500,25 +496,31 @@ fn finish_recording(app: &AppHandle) {
             frames: frames.len(),
             elapsed_ms: 0,
             memory_mb: 0,
-            stop_reason: reason.clone(),
+            stop_reason: reason,
         },
     );
-    if frames.is_empty() {
-        return;
+    if !frames.is_empty() {
+        {
+            let mut p = state.project.lock();
+            p.set_undo_enabled(state.settings.lock().enable_undo);
+            p.load(frames);
+            // 녹화는 아직 어디에도 저장되지 않았다 (버릴 때 묻기 위해). 바로 저장했으면 이미 저장됨.
+            p.dirty = saved.is_none();
+        }
+        show_editor(app);
+        if saved.is_none() {
+            let _ = app.emit("recorded", ());
+        }
     }
+    if !notes.is_empty() {
+        let _ = app.emit("notice", notes.join(" · "));
+    }
+    // 저장한 MP4가 있는 폴더는 편집 창을 띄운 다음에 연다. 먼저 열면 편집 창에 가려져,
+    // 녹화가 편집 창으로만 넘어가고 저장은 안 된 것처럼 보인다.
+    if let Some(path) = saved
+        && state.settings.lock().rec_direct_save_open_folder
     {
-        let mut p = state.project.lock();
-        p.set_undo_enabled(state.settings.lock().enable_undo);
-        p.load(frames);
-        // 녹화는 아직 어디에도 저장되지 않았다 (버릴 때 묻기 위해). 바로 저장했으면 이미 저장됨.
-        p.dirty = !direct_saved;
-    }
-    show_editor(app);
-    if !direct_saved {
-        let _ = app.emit("recorded", ());
-    }
-    if let Some(r) = reason {
-        let _ = app.emit("notice", r);
+        let _ = tauri_plugin_opener::reveal_item_in_dir(path);
     }
 }
 

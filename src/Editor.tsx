@@ -155,7 +155,8 @@ export default function Editor() {
 
   const showToast = useCallback((m: string) => {
     setToast(m);
-    window.setTimeout(() => setToast((c) => (c === m ? null : c)), 4000);
+    // 긴 알림(저장한 파일 경로 등)은 읽을 시간을 더 준다
+    window.setTimeout(() => setToast((c) => (c === m ? null : c)), Math.max(4000, m.length * 90));
   }, []);
 
   const blockWhileAppending = useCallback(() => {
