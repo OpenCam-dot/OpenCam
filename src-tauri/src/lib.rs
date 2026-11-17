@@ -530,7 +530,14 @@ fn finish_recording(app: &AppHandle) {
     if let Some(path) = saved
         && state.settings.lock().rec_direct_save_open_folder
     {
-        let _ = tauri_plugin_opener::reveal_item_in_dir(path);
+        // 편집 창을 앞으로 가져오는 일은 메인 스레드에 줄을 서서 처리된다. 폴더 열기도 그 줄 뒤에 세운다.
+        // 여기서 바로 열면, 이미 열려 있던 탐색기 창은 금방 앞으로 왔다가 뒤늦게 앞으로 오는 편집 창에 다시 가려질 수 있다.
+        // 탐색기를 부르는 일 자체는 오래 걸릴 수 있어 메인 스레드를 붙잡지 않게 따로 돌린다.
+        let _ = app.run_on_main_thread(move || {
+            std::thread::spawn(move || {
+                let _ = tauri_plugin_opener::reveal_item_in_dir(path);
+            });
+        });
     }
 }
 
