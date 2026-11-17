@@ -37,6 +37,8 @@ const FLOAT_BAR = 1080;
 /** 전체 화면에서 툴바를 숨겼을 때 위에 남기는 손잡이 (CSS px). 마우스를 대면 툴바가 내려온다. */
 const HANDLE_W = 120;
 const HANDLE_H = 6;
+/** 전체 화면일 때 녹화 틀 창의 높이 (CSS px, tauri.conf.json의 minHeight와 같게). 창은 툴바만 담는 띠다. */
+const FULL_WIN_H = 120;
 /** 기본 녹화 틀 크기 (CSS px, tauri.conf.json의 녹화 창 크기와 같게) */
 const DEFAULT_W = 820;
 const DEFAULT_H = 532;
@@ -121,7 +123,8 @@ export default function Recorder() {
     const b = Math.round(BORDER * dpr);
     const t = Math.round(TOOLBAR * dpr);
     if (fullRef.current) {
-      // 녹화는 모니터 전체(set_full_capture)이고 이 창은 캡처에서 빠진다. 구멍은 툴바 아래 전부.
+      // 녹화는 모니터 전체(set_full_capture)이고 이 창은 캡처에서 빠진다.
+      // 창은 화면 위 가운데의 띠(fitFullMonitor)이고 그중 툴바만 남긴다. 구멍은 툴바 아래 전부.
       const w = Math.min(size.width, Math.round(FLOAT_BAR * dpr));
       const bar = { x: Math.round((size.width - w) / 2), y: 0, w, h: t };
       const hw = Math.round(HANDLE_W * dpr);
@@ -311,18 +314,19 @@ export default function Recorder() {
       if (!m) throw new Error("모니터를 찾을 수 없습니다");
       await disableFull();
       frameOverride.current = null;
+      // 창으로 모니터를 통째로 덮지 않는다. 모니터만 한 창이 맨 위에 있으면 (구멍을 뚫어 놓아도) 웹 브라우저 같은
+      // 프로그램이 자기가 가려진 줄 알고 화면 그리기를 멈춰, 동영상이 멈추거나 나오지 않는다.
+      // 녹화 영역은 set_full_capture가 정하므로 창은 툴바만 담는 띠로 화면 위 가운데에 둔다.
       await win.setPosition(new PhysicalPosition(m.x, m.y));
-      await win.setSize(new PhysicalSize(m.w, m.h));
-      await win.setPosition(new PhysicalPosition(m.x, m.y));
-      await relayout();
-      const actualPos = await win.innerPosition(), actualSize = await win.innerSize();
-      if (actualPos.x !== m.x || actualPos.y !== m.y || actualSize.width !== m.w || actualSize.height !== m.h)
-        throw new Error("녹화 틀을 모니터 크기에 맞추지 못했습니다");
+      const dpr = await win.scaleFactor();
+      const w = Math.min(m.w, Math.round(FLOAT_BAR * dpr));
+      await win.setSize(new PhysicalSize(w, Math.round(FULL_WIN_H * dpr)));
+      await win.setPosition(new PhysicalPosition(m.x + Math.round((m.w - w) / 2), m.y));
       await api.setFullCapture(m);
       fullRef.current = m;
       setFullMonitor(m);
     } catch (e) { showNotice(errText(e)); }
-  }, [disableFull, relayout, showNotice, remember]);
+  }, [disableFull, showNotice, remember]);
 
   /**
    * 녹화 틀을 기본 크기로 지금 모니터 가운데에 놓는다 (되돌리기 단추, 영역 목록의 "기본 영역").
@@ -503,6 +507,8 @@ export default function Recorder() {
         const positions = [...settings.savedPositions];
         while (positions.length < 4) positions.push(null);
         if (e.shiftKey) {
+          // 전체 화면에서는 창이 툴바 띠일 뿐이라 저장할 틀 위치가 없다
+          if (fullMonitor) return showNotice("전체 화면에서는 위치를 저장할 수 없습니다");
           const pos = await win.outerPosition();
           positions[n] = [pos.x + layout.hole.x, pos.y + layout.hole.y, layout.hole.w, layout.hole.h];
           await saveSettings({ ...settings, savedPositions: positions });
