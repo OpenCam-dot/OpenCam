@@ -39,6 +39,8 @@ struct AppState {
     project: Mutex<Project>,
     append_busy: AtomicBool,
     recorder: Mutex<Option<Recorder>>,
+    /// 끝난 녹화를 마무리하는 중 (파일 정리부터 편집 창으로 넘어갈 때까지). 그동안은 새 녹화를 시작하지 않는다.
+    finishing: AtomicBool,
     /// 녹화 틀 창 안에서 뚫린 구멍의 위치 (물리 픽셀, 창 왼쪽 위 기준)
     hole: Mutex<Rect>,
     full_capture: Mutex<Option<Rect>>,
@@ -361,6 +363,11 @@ fn start_recording(app: &AppHandle) -> CmdResult<()> {
     if slot.is_some() {
         return Ok(());
     }
+    // 앞 녹화를 마무리하는 중에는 시작하지 않는다. 이때는 녹화 틀이 아직 보여서, 끝내려고 단축키를
+    // 연달아 두 번 누르면 새 녹화가 시작되고, 곧 녹화 틀이 숨겨진 뒤에도 그 녹화가 보이지 않게 계속됐다.
+    if state.finishing.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let region = capture_rect(app)?;
     if state.full_capture.lock().is_some() {
         use windows::Win32::Foundation::HWND;
@@ -451,6 +458,9 @@ fn finish_recording(app: &AppHandle) {
     let Some(rec) = slot.take() else {
         return;
     };
+    // 마무리가 끝날 때까지(이 함수가 어떻게 끝나든) 새 녹화를 막는다. 잠금을 쥔 채 켜서 시작 쪽과 엇갈리지 않게 한다.
+    state.finishing.store(true, Ordering::SeqCst);
+    let _finishing = Finishing(&state.finishing);
     drop(slot);
     // 단축키 해제는 메인 스레드가 처리한다. 여기서 잠금을 쥔 채 기다리면, 같은 잠금을 기다리는
     // 메인 스레드(단축키·창 이벤트)와 서로 기다리며 멈춘다. 그사이 새 녹화가 시작됐으면 그대로 둔다.
@@ -521,6 +531,15 @@ fn finish_recording(app: &AppHandle) {
         && state.settings.lock().rec_direct_save_open_folder
     {
         let _ = tauri_plugin_opener::reveal_item_in_dir(path);
+    }
+}
+
+/// 녹화를 마무리하는 동안 켜 두는 표시. 버려질 때 끈다.
+struct Finishing<'a>(&'a AtomicBool);
+
+impl Drop for Finishing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1912,6 +1931,7 @@ pub fn run() {
             append_busy: AtomicBool::new(false),
             settings: Mutex::new(settings),
             recorder: Mutex::new(None),
+            finishing: AtomicBool::new(false),
             hole: Mutex::new(Rect { x: 0, y: 0, w: 0, h: 0 }),
             full_capture: Mutex::new(None),
             hotkeys: Mutex::new((None, None)),

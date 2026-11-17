@@ -163,10 +163,19 @@ impl Screen for Capturer {
 }
 
 /// 직전 프레임이 화면에 보인 시간만큼 delay를 늘린다
-fn extend_last(s: &Shared, dt: Duration) {
+fn extend_last(s: &Shared, dt: Duration, carry: &mut Duration) {
     if let Some(prev) = s.frames.lock().last_mut() {
-        prev.delay_ms += dt.as_millis() as u32;
+        add_time(&mut prev.delay_ms, dt, carry);
     }
+}
+
+/// 흐른 시간 dt를 1ms 단위인 delay에 더한다. 1ms가 안 되는 자투리는 버리지 않고 carry에 남겨 다음에 더한다.
+/// 캡처할 때마다 자투리를 버리면 60FPS(한 칸 16.7ms)에서 16ms씩만 쌓여, 편집 창의 녹화가 실제보다 3~4% 짧아진다.
+fn add_time(delay_ms: &mut u32, dt: Duration, carry: &mut Duration) {
+    *carry += dt;
+    let ms = carry.as_millis() as u32;
+    *delay_ms += ms;
+    *carry -= Duration::from_millis(ms as u64);
 }
 
 fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status: impl Fn(RecStatus)) {
@@ -184,6 +193,7 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     // 마지막 캡처 시각. 그 뒤로 흐른 시간은 마지막 프레임이 보인 시간이다.
     let mut last_tick: Option<Instant> = None;
     let mut recorded = Duration::ZERO; // 일시정지 시간을 뺀 녹화 시간
+    let mut carry = Duration::ZERO; // 편집용 프레임 시간에 아직 못 넣은 1ms 미만의 자투리
     let mut bytes = 0usize;
     let mut last_report = Instant::now() - Duration::from_secs(1);
     let mut stop_reason = None;
@@ -204,7 +214,7 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
             if let Some(t) = last_tick.take() {
                 let dt = t.elapsed();
                 if extend {
-                    extend_last(&s, dt);
+                    extend_last(&s, dt, &mut carry);
                 }
                 recorded += dt;
                 if let Some(a) = &audio {
@@ -244,7 +254,7 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         if let Some(t) = last_tick.replace(now) {
             let dt = now.duration_since(t);
             if extend {
-                extend_last(&s, dt);
+                extend_last(&s, dt, &mut carry);
             }
             recorded += dt;
         }
@@ -290,7 +300,7 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     if let Some(t) = last_tick {
         let dt = t.elapsed();
         if extend {
-            extend_last(&s, dt);
+            extend_last(&s, dt, &mut carry);
         }
         recorded += dt;
     }
@@ -387,6 +397,18 @@ mod tests {
             self.0 = self.0.wrapping_add(1);
             Ok(vec![self.0; 64])
         }
+    }
+
+    /// 60FPS로 10초: 한 칸(16.667ms)씩 600번 더하면 10초가 돼야 한다.
+    /// 예전에는 매번 16ms로 잘라 넣어 9.6초가 됐다.
+    #[test]
+    fn frame_time_keeps_the_part_shorter_than_a_millisecond() {
+        let (mut delay, mut carry) = (0u32, Duration::ZERO);
+        for _ in 0..600 {
+            add_time(&mut delay, Duration::from_micros(16_667), &mut carry);
+        }
+        assert!((9_999..=10_001).contains(&delay), "{delay}ms");
+        assert!(carry < Duration::from_millis(1));
     }
 
     #[test]
