@@ -24,7 +24,7 @@ pub struct RecordOptions {
     pub cursor: CursorOptions,
     /// 녹화하면서 MP4로 바로 저장
     pub direct: Option<Mp4Stream>,
-    /// 바로 저장하는 MP4에 넣을 PC 소리 (direct가 있을 때만 쓴다)
+    /// 바로 저장하는 MP4에 넣을 PC 소리 (direct와 함께 준다)
     pub audio: Option<AudioCapture>,
     /// 바로 저장 중 메모리 한도에 닿으면 편집용 프레임만 그만 모으고 녹화는 계속
     pub drop_frames_after_limit: bool,
@@ -175,8 +175,8 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     let mut next = Instant::now();
     let mut last_px: Option<Arc<Vec<u8>>> = None;
     let direct = opts.direct.take();
-    // 소리는 MP4에만 넣는다. 녹화 시간이 흐르기 시작한 때와 멈춘 때를 알려 줘 영상과 맞춘다.
-    let audio = if direct.is_some() { opts.audio.take() } else { None };
+    // MP4에 넣을 소리. 녹화 시간이 흐르기 시작한 때와 멈춘 때를 알려 줘 영상과 맞춘다.
+    let audio = opts.audio.take();
     // MP4에 넣은 프레임 수. 녹화 시간 × FPS만큼 되도록 맞춰 넣는다.
     let mut written = 0u64;
     // 메모리 한도 뒤로는 편집용 프레임을 모으지 않는다 (바로 저장일 때)
@@ -218,10 +218,14 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         }
 
         let now = Instant::now();
-        let now_audio = audio::now();
         if now < next {
             std::thread::sleep((next - now).min(Duration::from_millis(5)));
             continue;
+        }
+        // 이번 캡처부터 녹화 시간이 흐른다(처음, 또는 일시정지가 풀린 뒤). 소리에게는 캡처하기 전에 알린다.
+        // 캡처는 길면 1초까지 걸리는데, 그 뒤에 알리면 그동안 온 소리가 버려져 앞부분이 무음이 된다.
+        if let (Some(a), None) = (&audio, last_tick) {
+            a.mark(audio::now(), true);
         }
         next += interval;
         if next < now {
@@ -243,9 +247,6 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
                 extend_last(&s, dt);
             }
             recorded += dt;
-        } else if let Some(a) = &audio {
-            // 녹화 시간은 이 캡처부터 흐른다 (처음, 또는 일시정지가 풀린 뒤)
-            a.mark(now_audio, true);
         }
         if let Some(d) = &direct {
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64 + 1;
@@ -302,17 +303,9 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         }
         let saved = d.finish().map_err(|e| format!("{e:#}"));
         if let Some(a) = audio {
-            // 소리 길이를 영상 길이(넣은 프레임 수)에 맞춘 뒤 MP4에 넣는다
+            // 영상 길이 = 넣은 프레임 수 ÷ FPS
             let total = Duration::from_secs_f64(written as f64 / fps as f64);
-            let warning = match (a.finish(total), &saved) {
-                (Ok(file), Ok(path)) if file.frames > 0 => crate::export::mux_audio(path, &file.path, file.rate)
-                    .err()
-                    .map(|e| format!("소리를 영상에 넣지 못했습니다 ({e:#})"))
-                    .or_else(|| file.warning.clone()),
-                (Ok(_), _) => None,
-                (Err(e), _) => Some(format!("소리를 녹음하지 못했습니다 ({e:#})")),
-            };
-            *s.audio_warning.lock() = warning;
+            *s.audio_warning.lock() = finish_sound(a, &saved, total);
         }
         *s.direct_result.lock() = Some(saved);
     }
@@ -326,6 +319,31 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     st.stop_reason = stop_reason;
     st.frames = s.frames.lock().len();
     on_status(st.clone());
+}
+
+/// 소리 길이를 영상 길이(total)에 맞춰 마무리하고 MP4에 넣는다. 문제가 있었으면 사용자에게 알릴 말을 돌려준다.
+/// 소리와 함께 녹화한 MP4는 마무리(faststart)를 미뤄 두었으므로, 소리를 못 넣어도 여기서 마무리한다.
+fn finish_sound(audio: AudioCapture, saved: &Result<PathBuf, String>, total: Duration) -> Option<String> {
+    let mut file = match audio.finish(total) {
+        Ok(file) => file,
+        Err(e) => {
+            if let Ok(path) = saved {
+                let _ = crate::export::finish_mp4(path, None, total);
+            }
+            return Some(format!("소리를 녹음하지 못했습니다 ({e:#})"));
+        }
+    };
+    // 영상을 저장하지 못했으면 할 일이 없다
+    let path = saved.as_ref().ok()?;
+    let sound = (file.frames > 0).then_some(file.path.as_path());
+    match crate::export::finish_mp4(path, sound, total) {
+        Ok(()) => file.warning.take(),
+        Err(e) => {
+            // 소리 없이라도 파일 마무리는 해 둔다 (실패해도 MP4는 재생된다)
+            let _ = crate::export::finish_mp4(path, None, total);
+            Some(format!("소리를 영상에 넣지 못했습니다 ({e:#})"))
+        }
+    }
 }
 
 fn report(
@@ -391,7 +409,7 @@ mod tests {
                 left_color: 0,
                 right_color: 0,
             },
-            direct: Some(Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80).unwrap()),
+            direct: Some(Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80, true).unwrap()),
             audio: None,
             drop_frames_after_limit: true,
         };
@@ -418,7 +436,7 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("opencam_direct_audio_{}", std::process::id()));
-        let direct = Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80).unwrap();
+        let direct = Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80, false).unwrap();
         let Ok(sound) = AudioCapture::start(&dir.join("d.audio.tmp")) else {
             eprintln!("소리 장치가 없어 건너뜀");
             let _ = direct.finish();

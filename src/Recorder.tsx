@@ -583,12 +583,14 @@ export default function Recorder() {
   const small = barW >= 560;
   // 되돌리기 단추 글자는 조금 더 좁을 때까지 보여 준다 (작게 드래그한 영역에서도 알아보게)
   const restoreText = barW >= 480;
-  const presetValue = settings.sizePresets.findIndex(([w, h]) => w === hole.w && h === hole.h);
   const captureSize = fullMonitor ?? hole;
-  // 녹음(PC 소리)은 MP4 저장이 켜져 있을 때만 된다
+  const presetValue = settings.sizePresets.findIndex(([w, h]) => w === captureSize.w && h === captureSize.h);
+  // 녹음(PC 소리)은 바로 저장하는 MP4에만 들어간다: 녹음을 켜면 MP4 저장도 켜고, MP4 저장을 끄면 녹음도 끈다
   const soundOn = settings.recDirectSave && settings.recDirectSaveAudio;
-  const withSound = (on: boolean): Settings =>
-    on ? { ...settings, recDirectSave: true, recDirectSaveAudio: true } : { ...settings, recDirectSaveAudio: false };
+  const setDirect = (on: boolean) => saveSettings({ ...settings, recDirectSave: on, recDirectSaveAudio: on && soundOn });
+  const setSound = (on: boolean) =>
+    saveSettings(on ? { ...settings, recDirectSave: true, recDirectSaveAudio: true } : { ...settings, recDirectSaveAudio: false });
+  const setCursor = (on: boolean) => saveSettings({ ...settings, captureCursor: on });
   // 틀에서 떼어 둔 툴바는 끌어도 창 전체가 움직이므로 끌기를 막는다
   const drag = mode === "normal" ? "" : undefined;
 
@@ -596,6 +598,7 @@ export default function Recorder() {
   // 영역 목록에는 녹화할 곳과 해상도(직접 입력, 저장해 둔 크기)가 함께 있다.
   const areaSelect = (
     <select
+      className="narrow"
       value=""
       onChange={(e) => {
         const v = e.target.value;
@@ -654,19 +657,28 @@ export default function Recorder() {
       <option value="custom">{FPS_LIST.includes(settings.fps) ? "직접 입력" : `${settings.fps} FPS`}</option>
     </select>
   );
-  const pick = (icon: React.ReactNode, title: string, iconOnly: boolean, select: React.ReactNode, showIcon = true, cls = "") =>
+  const pick = (icon: React.ReactNode, title: string, iconOnly: boolean, select: React.ReactNode, showIcon = true) =>
     iconOnly ? (
       <label className="rec-btn icon menu" title={title}>
         {icon}
         {select}
       </label>
     ) : (
-      <label className={`rec-dd ${cls}`} title={title}>
+      <label className="rec-dd" title={title}>
         {showIcon && icon}
         {select}
         <IconChevronDown size={14} className="chev" />
       </label>
     );
+
+  const toggle = (icon: React.ReactNode, name: string, title: string, on: boolean, set: (on: boolean) => void) => (
+    <label className="rec-switch" title={title}>
+      {icon}
+      <span>{name}</span>
+      <input type="checkbox" checked={on} onChange={(e) => set(e.target.checked)} />
+      <i />
+    </label>
+  );
 
   // 스위치를 앞에서부터 차례로 드러낸다 (모양은 recorder.css).
   // 자리가 조금 생기면 첫 스위치가 이름 없이 "아이콘 토글"로 나오고, 넓어질수록 이름이 "M…"부터 드러난다.
@@ -772,8 +784,6 @@ export default function Recorder() {
                 `녹화할 곳·해상도 정하기 (지금: ${fullMonitor ? "전체 화면, " : ""}${captureSize.w} × ${captureSize.h})`,
                 !withHotkey,
                 areaSelect,
-                true,
-                "narrow",
               )}
               {sizeDraft && (
                 <span className="rec-size" title="녹화 영역 크기 (Enter로 적용, Esc로 취소)">
@@ -829,33 +839,9 @@ export default function Recorder() {
         <span className="rec-spacer" data-tauri-drag-region={drag}>
           {!recording &&
             reveal([
-              <label className="rec-switch" title="녹화하면서 MP4 파일로 바로 저장">
-                <IconMovie size={16} />
-                <span>MP4 저장</span>
-                <input
-                  type="checkbox"
-                  checked={settings.recDirectSave}
-                  onChange={(e) => saveSettings({ ...settings, recDirectSave: e.target.checked })}
-                />
-                <i />
-              </label>,
-              // 소리는 바로 저장하는 MP4에만 들어가므로, 녹음을 켜면 MP4 저장도 같이 켠다
-              <label className="rec-switch" title="PC에서 나는 소리도 MP4에 넣기 (MP4 저장이 함께 켜집니다)">
-                <IconVolume size={16} />
-                <span>녹음</span>
-                <input type="checkbox" checked={soundOn} onChange={(e) => saveSettings(withSound(e.target.checked))} />
-                <i />
-              </label>,
-              <label className="rec-switch" title="마우스 커서 녹화">
-                <IconPointer size={16} />
-                <span>커서</span>
-                <input
-                  type="checkbox"
-                  checked={settings.captureCursor}
-                  onChange={(e) => saveSettings({ ...settings, captureCursor: e.target.checked })}
-                />
-                <i />
-              </label>,
+              toggle(<IconMovie size={16} />, "MP4 저장", "녹화하면서 MP4 파일로 바로 저장", settings.recDirectSave, setDirect),
+              toggle(<IconVolume size={16} />, "녹음", "PC에서 나는 소리도 MP4에 넣기 (MP4 저장이 함께 켜집니다)", soundOn, setSound),
+              toggle(<IconPointer size={16} />, "커서", "마우스 커서 녹화", settings.captureCursor, setCursor),
             ])}
         </span>
         {windowChoices && !recording && (
@@ -899,9 +885,9 @@ export default function Recorder() {
               else if (v === "full") fitFullMonitor();
               else if (v === "default") resetFrame();
               else if (v === "settings") openSettings();
-              else if (v === "mp4") saveSettings({ ...settings, recDirectSave: !settings.recDirectSave });
-              else if (v === "sound") saveSettings(withSound(!soundOn));
-              else if (v === "cursor") saveSettings({ ...settings, captureCursor: !settings.captureCursor });
+              else if (v === "mp4") setDirect(!settings.recDirectSave);
+              else if (v === "sound") setSound(!soundOn);
+              else if (v === "cursor") setCursor(!settings.captureCursor);
               else if (v) openMenu(v);
             }}
           >

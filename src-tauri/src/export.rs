@@ -1063,6 +1063,17 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     std::env::split_paths(&path).map(|p| p.join("ffmpeg.exe")).find(|p| p.exists())
 }
 
+/// 검은 콘솔 창을 띄우지 않고 ffmpeg를 실행할 준비를 한다. ffmpeg를 찾지 못하면 None.
+pub(crate) fn ffmpeg() -> Option<Command> {
+    let mut cmd = Command::new(find_ffmpeg()?);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    Some(cmd)
+}
+
 /// ffmpeg 오류 메시지는 끝부분 이만큼만 남긴다
 pub(crate) const STDERR_TAIL: usize = 8 * 1024;
 
@@ -1109,14 +1120,13 @@ pub(crate) fn spawn_stderr_tail(
 }
 
 fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Settings, progress: Progress) -> Result<()> {
-    let ffmpeg = find_ffmpeg()
+    let mut cmd = ffmpeg()
         .ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. ffmpeg를 설치하거나 프로그램 폴더에 넣어 주세요."))?;
     let (w, h) = (frames[0].width, frames[0].height);
     // 프레임마다 시간이 달라서, 가장 짧은 프레임 기준의 고정 FPS로 맞춰 같은 화면을 반복해서 넣는다
     let min_delay = frames.iter().map(|f| f.delay_ms.max(10)).min().unwrap_or(100);
     let fps = (1000 / min_delay).clamp(1, 60);
     let q = quality.min(100) as f32;
-    let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba"])
         .args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
         // yuv420p는 가로·세로가 짝수여야 한다
@@ -1143,11 +1153,6 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
         }
     }
     cmd.arg(path).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: 검은 콘솔 창을 띄우지 않는다
-    }
     let mut child = cmd.spawn().context("ffmpeg 실행 실패")?;
     // 여기부터는 어느 길로 나가든 ffmpeg를 기다리고 stderr 스레드를 join한다.
     // stderr를 따로 읽지 않으면 ffmpeg가 오류를 많이 쓸 때 서로 기다리며 멈춘다
@@ -1206,28 +1211,24 @@ pub struct Mp4Stream {
 }
 
 impl Mp4Stream {
-    pub fn start(path: &Path, w: u32, h: u32, fps: u32, quality: u8) -> Result<Self> {
-        let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow!("MP4로 바로 저장하려면 ffmpeg가 필요합니다"))?;
+    /// faststart: 다 만든 뒤 파일 정보를 앞쪽으로 옮긴다(웹에서 바로 재생되게). 파일을 한 번 더 쓰는 일이라,
+    /// 뒤에 소리를 넣으면서 어차피 다시 쓸 때는 끈다.
+    pub fn start(path: &Path, w: u32, h: u32, fps: u32, quality: u8, faststart: bool) -> Result<Self> {
+        let mut cmd = ffmpeg().ok_or_else(|| anyhow!("MP4로 바로 저장하려면 ffmpeg가 필요합니다"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let crf = (51.0 - quality.min(100) as f32 * 0.4).round() as u32; // 화질 90 → crf 15
-        let mut cmd = Command::new(ffmpeg);
         cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{w}x{h}"), "-r", &fps.clamp(1, 100).to_string(), "-i", "-"])
             .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
             // 녹화와 동시에 해야 하므로 빠른 설정
             .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", &crf.to_string()])
-            .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
+            .args(["-pix_fmt", "yuv420p"]);
+        if faststart {
+            cmd.args(["-movflags", "+faststart"]);
         }
+        cmd.arg(path).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
         let mut child = cmd.spawn().context("ffmpeg 실행 실패")?;
         let mut stdin = BufWriter::new(child.stdin.take().unwrap());
         // 녹화가 잠깐 밀려도 버틸 만큼만 쌓아 둔다 (너무 밀리면 녹화가 기다린다)
@@ -1268,38 +1269,54 @@ impl Mp4Stream {
     }
 }
 
-/// 소리 없는 MP4에 소리(16비트 스테레오, 헤더 없는 파일)를 넣는다. 영상은 다시 만들지 않고 그대로 옮긴다.
-/// 실패하면 원래 MP4는 그대로 남는다.
-pub fn mux_audio(video: &Path, audio: &Path, rate: u32) -> Result<()> {
-    let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow!("ffmpeg를 찾을 수 없습니다"))?;
+/// 16비트 스테레오 소리를 stdin으로 받아 AAC 파일로 만드는 ffmpeg를 띄운다.
+/// 녹화하는 동안 소리를 미리 바꿔 두면, 녹화가 끝났을 때 영상에 붙이기만 하면 된다.
+pub fn aac_encoder(path: &Path, rate: u32) -> Result<std::process::Child> {
+    let mut cmd = ffmpeg().ok_or_else(|| anyhow!("ffmpeg를 찾을 수 없습니다"))?;
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+        .args(["-f", "s16le", "-ar", &rate.to_string(), "-ac", "2", "-i", "-"])
+        // AAC는 48000Hz까지가 무난하다
+        .args(["-c:a", "aac", "-b:a", "160k", "-ar", &rate.min(48000).to_string(), "-f", "mp4"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.spawn().context("ffmpeg 실행 실패")
+}
+
+/// 소리와 함께 녹화한 MP4를 마무리한다: 소리 파일(`aac_encoder`가 만든 것)이 있으면 넣고,
+/// 파일 정보를 앞쪽으로 옮긴다(faststart). 영상도 소리도 다시 만들지 않고 그대로 옮긴다.
+/// 소리가 영상보다 조금 길 수 있어 영상 길이(total)에서 자른다. 실패하면 원래 MP4는 그대로 남는다.
+pub fn finish_mp4(video: &Path, audio: Option<&Path>, total: std::time::Duration) -> Result<()> {
+    let mut cmd = ffmpeg().ok_or_else(|| anyhow!("ffmpeg를 찾을 수 없습니다"))?;
     // 새 파일로 만든 뒤 성공했을 때만 원래 파일과 바꾼다
     let tmp = video.with_extension("mux.tmp");
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(video)
-        .args(["-f", "s16le", "-ar", &rate.to_string(), "-ac", "2", "-i"])
-        .arg(audio)
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"])
-        // AAC는 48000Hz까지가 무난하다
-        .args(["-c:a", "aac", "-b:a", "160k", "-ar", &rate.min(48000).to_string()])
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"]).arg(video);
+    if let Some(audio) = audio {
+        cmd.arg("-i").arg(audio).args(["-map", "0:v:0", "-map", "1:a:0"]);
+    }
+    cmd.args(["-c", "copy"])
+        .args(["-t", &format!("{:.3}", total.as_secs_f64())])
         .args(["-movflags", "+faststart", "-f", "mp4"])
         .arg(&tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
     let status = cmd.status().context("ffmpeg 실행 실패")?;
     if !status.success() {
         let _ = std::fs::remove_file(&tmp);
         bail!("ffmpeg 종료 코드 {:?}", status.code());
     }
-    std::fs::rename(&tmp, video).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
+    // 막 만든 MP4는 백신 같은 다른 프로그램이 잠깐 잡고 있을 수 있어, 바꾸기를 몇 번 다시 해 본다
+    let mut tries = 0;
+    while let Err(e) = std::fs::rename(&tmp, video) {
+        tries += 1;
+        if tries >= 5 {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).context("마무리한 파일로 바꾸지 못했습니다");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     Ok(())
 }
 
@@ -1436,16 +1453,16 @@ pub(crate) fn composite_gif(bytes: &[u8]) -> Vec<CompositedGifFrame> {
 /// 테스트용: 동영상 파일에 소리 줄기가 있는지, 길이가 몇 초인지 ffmpeg에게 물어본다
 #[cfg(test)]
 pub fn probe_audio(path: &Path) -> (bool, f64) {
-    let out = Command::new(find_ffmpeg().unwrap()).args(["-hide_banner", "-i"]).arg(path).output().unwrap();
+    let out = ffmpeg().unwrap().args(["-hide_banner", "-i"]).arg(path).output().unwrap();
     let text = String::from_utf8_lossy(&out.stderr).to_string();
     // "Duration: 00:00:01.00, ..."
-    let secs = text
+    let ms = text
         .split("Duration: ")
         .nth(1)
         .and_then(|t| t.split(',').next())
-        .map(|t| t.trim().split(':').fold(0.0, |acc, part| acc * 60.0 + part.parse::<f64>().unwrap_or(0.0)))
-        .unwrap_or(0.0);
-    (text.contains("Audio: aac"), secs)
+        .and_then(crate::import::parse_ffmpeg_timestamp)
+        .unwrap_or(0);
+    (text.contains("Audio: aac"), ms as f64 / 1000.0)
 }
 
 #[cfg(test)]
@@ -1453,40 +1470,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mux_audio_adds_a_sound_track_without_touching_the_picture() {
+    fn sound_is_encoded_while_recording_and_joined_to_the_video_in_sync() {
         if find_ffmpeg().is_none() {
             return;
         }
         let dir = std::env::temp_dir().join(format!("opencam_mux_{}", std::process::id()));
-        // 1초짜리 영상 (10fps, 10장)
+        // 1초짜리 영상 (10fps, 10장). 소리를 넣을 것이라 faststart는 끈다.
         let video = dir.join("v.mp4");
-        let stream = Mp4Stream::start(&video, 16, 16, 10, 80).unwrap();
+        let stream = Mp4Stream::start(&video, 16, 16, 10, 80, false).unwrap();
         for i in 0..10u8 {
             stream.push(std::sync::Arc::new(vec![i * 20; 16 * 16 * 4]), 1);
         }
         stream.finish().unwrap();
-        assert_eq!(probe_audio(&video).0, false);
+        assert!(!probe_audio(&video).0);
         let before = std::fs::metadata(&video).unwrap().len();
-        // 1초짜리 소리 (48000Hz 스테레오, 440Hz 음)
-        let audio = dir.join("a.raw");
-        let pcm: Vec<u8> = (0..48000)
+        // 소리: 0.5초 무음 뒤에 0.9초 동안 440Hz 음 (영상보다 0.4초 길다)
+        let audio = dir.join("a.tmp");
+        let mut encoder = aac_encoder(&audio, 48000).unwrap();
+        let pcm: Vec<u8> = (0..48000 * 14 / 10)
             .flat_map(|i| {
-                let v = ((i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 8000.0) as i16;
+                let v = if i < 24000 { 0 } else { ((i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 8000.0) as i16 };
                 [v.to_le_bytes(), v.to_le_bytes()].concat()
             })
             .collect();
-        std::fs::write(&audio, pcm).unwrap();
-        mux_audio(&video, &audio, 48000).unwrap();
+        encoder.stdin.take().unwrap().write_all(&pcm).unwrap();
+        assert!(encoder.wait().unwrap().success());
+        finish_mp4(&video, Some(&audio), std::time::Duration::from_secs(1)).unwrap();
         let (has_audio, secs) = probe_audio(&video);
         assert!(has_audio);
-        assert!((secs - 1.0).abs() < 0.15, "{secs}초");
+        assert!((secs - 1.0).abs() < 0.1, "영상 길이에서 잘라야 한다: {secs}초");
         assert!(std::fs::metadata(&video).unwrap().len() > before);
         assert!(!video.with_extension("mux.tmp").exists(), "임시 파일을 남기지 않는다");
+        // 소리를 다시 풀어 보면 음이 0.5초에서 시작한다 (변환·붙이기를 거쳐도 화면과 어긋나지 않는다)
+        let out = ffmpeg()
+            .unwrap()
+            .args(["-v", "error", "-i"])
+            .arg(&video)
+            .args(["-vn", "-f", "s16le", "-ac", "1", "-ar", "48000", "-"])
+            .output()
+            .unwrap();
+        let onset = out.stdout.chunks_exact(2).position(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() > 2000).unwrap();
+        assert!((0.46..0.54).contains(&(onset as f64 / 48000.0)), "음이 시작한 때 {}초", onset as f64 / 48000.0);
         // 소리 파일이 없으면 실패하고, 원래 영상은 그대로 남는다
         let kept = std::fs::read(&video).unwrap();
-        assert!(mux_audio(&video, &dir.join("none.raw"), 48000).is_err());
+        assert!(finish_mp4(&video, Some(&dir.join("none.tmp")), std::time::Duration::from_secs(1)).is_err());
         assert_eq!(std::fs::read(&video).unwrap(), kept);
         assert!(!video.with_extension("mux.tmp").exists());
+        // 소리 없이 마무리만 해도 된다
+        finish_mp4(&video, None, std::time::Duration::from_secs(1)).unwrap();
+        assert!(probe_audio(&video).0, "이미 들어 있는 소리는 그대로");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2298,7 +2330,7 @@ mod tests {
         export(&fr, &p, &opts(Format::Avif), &s, &|_, _| {}).unwrap();
         assert!(std::fs::metadata(&p).unwrap().len() > 0);
         // 바로 저장: 3장을 넣으면(앞 장은 2번) 4프레임짜리 MP4
-        let m = Mp4Stream::start(&dir.join("d.mp4"), 16, 8, 10, 90).unwrap();
+        let m = Mp4Stream::start(&dir.join("d.mp4"), 16, 8, 10, 90, true).unwrap();
         m.push(std::sync::Arc::new(fr[0].rgba()), 2);
         m.push(std::sync::Arc::new(fr[1].rgba()), 1);
         m.push(std::sync::Arc::new(fr[2].rgba()), 1);

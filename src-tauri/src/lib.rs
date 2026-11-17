@@ -377,30 +377,32 @@ fn start_recording(app: &AppHandle) -> CmdResult<()> {
     }
     let s = state.settings.lock().clone();
     // MP4 바로 저장: 저장 폴더에 파일 이름 규칙대로
-    let direct = if s.rec_direct_save {
+    let (direct, audio) = if s.rec_direct_save {
         let name = export::file_name_from_rule(&s.file_name_rule);
         let path = export::unique_path(Path::new(&s.output_dir), &name, "mp4");
-        Some(
-            export::Mp4Stream::start(
-                &path,
-                region.w as u32,
-                region.h as u32,
-                s.fps.clamp(1, 100),
-                s.rec_direct_save_quality,
-            )
-            .map_err(|e| format!("{e:#}"))?,
+        // PC 소리도 넣기로 했으면 소리부터 받기 시작한다. 소리 장치를 못 열면 알리고 소리 없이 녹화한다.
+        let audio = if s.rec_direct_save_audio {
+            audio::AudioCapture::start(&path.with_extension("audio.tmp"))
+                .inspect_err(|e| {
+                    let _ = app.emit("notice", format!("소리를 녹음할 수 없어 소리 없이 녹화합니다 ({e:#})"));
+                })
+                .ok()
+        } else {
+            None
+        };
+        // 소리를 넣을 때는 녹화 끝에 파일을 다시 쓰므로, 영상만 만들 때의 마무리(faststart)는 그때 한 번만 한다
+        let stream = export::Mp4Stream::start(
+            &path,
+            region.w as u32,
+            region.h as u32,
+            s.fps.clamp(1, 100),
+            s.rec_direct_save_quality,
+            audio.is_none(),
         )
+        .map_err(|e| format!("{e:#}"))?;
+        (Some(stream), audio)
     } else {
-        None
-    };
-    // 바로 저장하는 MP4에 PC 소리도 넣기. 소리 장치를 못 열면 소리 없이 녹화한다.
-    let audio = match &direct {
-        Some(d) if s.rec_direct_save_audio => audio::AudioCapture::start(&d.path.with_extension("audio.tmp"))
-            .inspect_err(|e| {
-                let _ = app.emit("notice", format!("소리를 녹음할 수 없어 소리 없이 녹화합니다 ({e:#})"));
-            })
-            .ok(),
-        _ => None,
+        (None, None)
     };
     let no_limit = s.rec_no_time_limit || (direct.is_some() && s.rec_direct_save_no_time_limit);
     let opts = RecordOptions {
@@ -636,7 +638,10 @@ fn get_settings(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> CmdResult<()> {
+fn set_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) -> CmdResult<()> {
+    // 소리는 바로 저장하는 MP4에만 들어간다. MP4 저장을 끄면 소리 넣기도 같이 꺼 둔다
+    // (나중에 MP4 저장만 켰는데 소리가 말없이 들어가는 일이 없게).
+    settings.rec_direct_save_audio &= settings.rec_direct_save;
     settings::save(&settings).map_err(err)?;
     state.project.lock().set_undo_enabled(settings.enable_undo);
     let on_top = settings.always_on_top;

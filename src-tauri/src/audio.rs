@@ -2,16 +2,16 @@
 //!
 //! 방식:
 //! - WASAPI 루프백: 기본 출력 장치로 나가는 소리를 그대로 받는다
+//! - 받은 소리는 16비트 스테레오로 ffmpeg에 흘려보내 녹화하는 동안 AAC 파일로 만들어 둔다.
+//!   녹화가 끝나면 그 파일을 영상에 그대로 붙이기만 하면 된다 (`export::finish_mp4`)
 //! - 아무 소리도 안 나는 동안에는 Windows가 소리를 주지 않는다. 소리 묶음마다 붙어 오는 시각으로
 //!   녹화 시간 안의 자리를 정하고, 빈 곳은 무음으로 채운다
 //! - 일시정지한 동안의 소리는 버린다 (녹화 스레드가 `mark`로 알려 준다)
-//! - 파일에는 16비트 스테레오를 헤더 없이 쌓는다. 녹화가 끝나면 ffmpeg가 영상에 합친다
 //! - 녹화 중 기본 출력 장치가 바뀌면(이어폰 연결 등) 새 장치로 옮겨 받는다
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,9 +19,10 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, WAVEFORMATEX, eConsole, eRender,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eConsole,
+    eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -32,9 +33,10 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 const TICKS: i64 = 10_000_000;
 /// Windows에 부탁하는 소리 버퍼 길이 (1초). 받는 쪽이 잠깐 밀려도 소리가 끊기지 않는다.
 const BUFFER: i64 = TICKS;
-/// 소리 묶음에 붙는 표시: 무음 / 시각을 믿을 수 없음
-const FLAG_SILENT: u32 = 0x2;
-const FLAG_TIMESTAMP_ERROR: u32 = 0x4;
+/// 소리를 꺼내러 가는 간격. 버퍼가 1초라 넉넉하고, 자리는 묶음의 시각으로 정하므로 정확도와 상관없다.
+const POLL: Duration = Duration::from_millis(20);
+/// 소리 묶음은 조금 늦게 도착한다. 이만큼 지난 시각까지는 올 소리가 다 왔다고 본다.
+const SETTLED: i64 = TICKS / 5;
 
 /// 지금 시각 (`TICKS` 단위). `AudioCapture::mark`에 넘긴다.
 pub fn now() -> i64 {
@@ -53,12 +55,10 @@ pub fn now() -> i64 {
     (c as i128 * TICKS as i128 / freq as i128) as i64
 }
 
-/// 녹음한 소리 파일 (16비트 스테레오, 헤더 없음). 다 쓰고 버리면 파일도 지운다.
+/// 녹음한 소리 파일 (AAC). 다 쓰고 버리면 파일도 지운다.
 pub struct AudioFile {
     pub path: PathBuf,
-    /// 1초에 몇 묶음(샘플)인지
-    pub rate: u32,
-    /// 들어 있는 길이 (샘플 묶음 수)
+    /// 들어 있는 길이 (샘플 묶음 수). 0이면 넣을 소리가 없다.
     pub frames: u64,
     /// 녹음 중 생긴 문제 (소리 장치가 바뀜 등). 사용자에게 알린다.
     pub warning: Option<String>,
@@ -70,48 +70,45 @@ impl Drop for AudioFile {
     }
 }
 
+/// 녹화가 돌기 시작한 시각(true)·멈춘 시각(false) 목록. 녹화 스레드가 넣고 소리 스레드가 꺼낸다.
+type Marks = Mutex<VecDeque<(i64, bool)>>;
+
 struct Shared {
     stop: AtomicBool,
-    /// 녹화가 돌기 시작한 시각(true)·멈춘 시각(false). 녹화 스레드가 넣고 소리 스레드가 꺼낸다.
-    marks: Mutex<VecDeque<(i64, bool)>>,
+    marks: Marks,
     /// 끝낼 때 맞출 전체 길이
     total: Mutex<Option<Duration>>,
-    warning: Mutex<Option<String>>,
 }
+
+/// 소리 스레드가 끝나며 돌려주는 것: 담은 길이(샘플 묶음 수)와 알릴 문제
+type Captured = (u64, Option<String>);
 
 pub struct AudioCapture {
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<Result<u64>>>,
+    thread: Option<JoinHandle<Result<Captured>>>,
     path: PathBuf,
-    rate: u32,
 }
 
 impl AudioCapture {
     /// 소리 받기를 시작한다. 장치가 없거나 열 수 없으면 바로 오류를 돌려준다.
     /// `mark(시각, true)`를 부르기 전의 소리는 버린다.
     pub fn start(path: &Path) -> Result<Self> {
-        let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            marks: Mutex::new(VecDeque::new()),
-            total: Mutex::new(None),
-            warning: Mutex::new(None),
-        });
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let shared =
+            Arc::new(Shared { stop: AtomicBool::new(false), marks: Mutex::new(VecDeque::new()), total: Mutex::new(None) });
         let (tx, rx) = mpsc::channel();
         let (s, p) = (shared.clone(), path.to_path_buf());
         let thread = std::thread::Builder::new().name("opencam-audio".into()).spawn(move || capture_thread(&s, &p, tx))?;
-        let rate = match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(rate)) => rate,
-            failed => {
-                shared.stop.store(true, Ordering::SeqCst);
-                let _ = thread.join();
-                let _ = std::fs::remove_file(path);
-                return Err(match failed {
-                    Ok(Err(e)) => e,
-                    _ => anyhow!("소리 장치가 응답하지 않습니다"),
-                });
-            }
-        };
-        Ok(AudioCapture { shared, thread: Some(thread), path: path.to_path_buf(), rate })
+        // 여기서 오류로 나가면 Drop이 스레드를 멈추고 파일을 지운다
+        let capture = AudioCapture { shared, thread: Some(thread), path: path.to_path_buf() };
+        // 보통 0.1초 안에 열린다. 녹화 시작이 오래 멈추지 않게 2초만 기다린다.
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => Ok(capture),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("소리 장치가 응답하지 않습니다")),
+        }
     }
 
     /// 녹화가 돌기 시작했거나(running) 멈췄음(일시정지)을 그 시각(`now()`)과 함께 알린다
@@ -119,26 +116,16 @@ impl AudioCapture {
         self.shared.marks.lock().push_back((at, running));
     }
 
-    /// 녹음을 끝내고 파일 길이를 영상 길이(total)에 맞춘다. 모자라면 무음을 붙이고 넘치면 자른다.
+    /// 녹음을 끝낸다. 소리가 영상 길이(total)보다 짧으면 무음을 붙인다.
+    /// (조금 넘치는 것은 영상에 넣을 때 영상 길이에서 자른다.)
     pub fn finish(mut self, total: Duration) -> Result<AudioFile> {
         *self.shared.total.lock() = Some(total);
         self.shared.stop.store(true, Ordering::SeqCst);
-        let joined = self.thread.take().map(|t| t.join());
-        match joined {
-            Some(Ok(Ok(frames))) => Ok(AudioFile {
-                path: self.path.clone(),
-                rate: self.rate,
-                frames,
-                warning: self.shared.warning.lock().take(),
-            }),
-            other => {
-                let _ = std::fs::remove_file(&self.path);
-                match other {
-                    Some(Ok(Err(e))) => Err(e),
-                    _ => bail!("소리 녹음이 비정상으로 끝났습니다"),
-                }
-            }
-        }
+        // 여기서부터 파일은 AudioFile이 맡는다 (오류로 나가도 지워진다)
+        let mut file = AudioFile { path: self.path.clone(), frames: 0, warning: None };
+        let thread = self.thread.take().ok_or_else(|| anyhow!("소리 녹음이 이미 끝났습니다"))?;
+        (file.frames, file.warning) = thread.join().map_err(|_| anyhow!("소리 녹음이 비정상으로 끝났습니다"))??;
+        Ok(file)
     }
 }
 
@@ -176,25 +163,40 @@ impl Timeline {
         }
     }
 
+    /// 시각 upto까지의 표시를 꺼내 반영한다
+    fn apply(&mut self, marks: &Marks, upto: i64) {
+        let mut marks = marks.lock();
+        while let Some(&(at, running)) = marks.front().filter(|m| m.0 <= upto) {
+            marks.pop_front();
+            self.mark(at, running);
+        }
+    }
+
     /// 시각 at이 녹화 시간으로 언제인지. 녹화가 멈춰 있을 때의 시각이면 None.
     fn at(&self, at: i64) -> Option<i64> {
         self.since.filter(|s| at >= *s).map(|s| self.done + (at - s))
     }
 }
 
-// ---------- 소리 파일 ----------
+// ---------- 소리 줄기 ----------
 
-/// 16비트 스테레오를 헤더 없이 쌓는 파일. 녹화 시간에 맞는 자리에 소리를 놓는다.
-struct Track {
-    out: BufWriter<File>,
+/// 16비트 스테레오(왼쪽·오른쪽 번갈아, 4바이트가 한 묶음)를 차례로 흘려보낸다.
+/// 녹화 시간에 맞는 자리에 소리를 놓는다. 한 번 보낸 것은 되돌릴 수 없다(뒤로만 간다).
+struct Track<W: Write> {
+    out: W,
     rate: u32,
-    /// 지금까지 쓴 길이 (샘플 묶음 수)
+    /// 지금까지 보낸 길이 (샘플 묶음 수)
     frames: u64,
 }
 
-impl Track {
-    fn create(path: &Path, rate: u32) -> std::io::Result<Self> {
-        Ok(Track { out: BufWriter::with_capacity(1 << 16, File::create(path)?), rate, frames: 0 })
+impl<W: Write> Track<W> {
+    fn new(out: W, rate: u32) -> Self {
+        Track { out, rate, frames: 0 }
+    }
+
+    /// 녹화 시간 pos(`TICKS` 단위)가 지금까지 보낸 것보다 몇 묶음 뒤인지 (앞이면 음수)
+    fn gap(&self, pos: i64) -> i64 {
+        (pos.max(0) as i128 * self.rate as i128 / TICKS as i128) as i64 - self.frames as i64
     }
 
     fn silence(&mut self, frames: u64) -> std::io::Result<()> {
@@ -209,37 +211,40 @@ impl Track {
         Ok(())
     }
 
-    /// 녹화 시간 pos(`TICKS` 단위)에 소리(왼쪽·오른쪽 번갈아)를 놓는다.
-    /// 파일 끝과 거의 이어지면 그대로 붙이고, 비었으면 무음을 채우고, 겹치면 겹친 만큼 버린다.
-    fn put(&mut self, pos: i64, mut samples: &[i16]) -> std::io::Result<()> {
-        let want = (pos.max(0) as i128 * self.rate as i128 / TICKS as i128) as i64;
-        let gap = want - self.frames as i64;
+    /// 녹화 시간 pos에 소리를 놓는다.
+    /// 지금까지 보낸 것과 거의 이어지면 그대로 붙이고, 비었으면 무음을 채우고, 겹치면 겹친 만큼 버린다.
+    fn put(&mut self, pos: i64, mut sound: &[u8]) -> std::io::Result<()> {
+        let gap = self.gap(pos);
         // 시각은 조금씩 흔들린다. 0.05초 안쪽 차이는 이어진 소리로 본다.
         let tol = (self.rate / 20) as i64;
         if gap > tol {
             self.silence(gap as u64)?;
         } else if gap < -tol {
-            let skip = ((-gap) as usize).min(samples.len() / 2);
-            samples = &samples[skip * 2..];
+            let skip = ((-gap) as usize).min(sound.len() / 4);
+            sound = &sound[skip * 4..];
         }
-        for v in samples {
-            self.out.write_all(&v.to_le_bytes())?;
-        }
-        self.frames += (samples.len() / 2) as u64;
+        self.out.write_all(sound)?;
+        self.frames += (sound.len() / 4) as u64;
         Ok(())
     }
 
-    /// 길이를 total에 맞추고 닫는다. 맞춘 길이를 돌려준다.
-    fn finish(mut self, total: Duration) -> std::io::Result<u64> {
+    /// 소리가 오지 않는 동안에도 녹화 시간 pos까지 무음을 채워 둔다 (0.5초 넘게 뒤처졌을 때만).
+    /// 이렇게 해 두지 않으면 조용한 녹화는 끝날 때 무음을 한꺼번에 만드느라 오래 기다린다.
+    fn catch_up(&mut self, pos: i64) -> std::io::Result<()> {
+        let gap = self.gap(pos);
+        if gap > (self.rate / 2) as i64 {
+            self.silence(gap as u64)?;
+        }
+        Ok(())
+    }
+
+    /// 길이가 total보다 짧으면 무음을 붙이고, 모아 둔 것을 모두 내보낸다
+    fn pad_to(&mut self, total: Duration) -> std::io::Result<()> {
         let want = (total.as_secs_f64() * self.rate as f64).round() as u64;
         if self.frames < want {
             self.silence(want - self.frames)?;
         }
-        self.out.flush()?;
-        if self.frames > want {
-            self.out.get_ref().set_len(want * 4)?;
-        }
-        Ok(want)
+        self.out.flush()
     }
 }
 
@@ -274,6 +279,11 @@ impl Format {
     fn block(&self) -> usize {
         self.sample_bytes() * self.channels
     }
+
+    /// 이미 16비트 스테레오라 바꿀 것이 없는지
+    fn is_stereo16(&self) -> bool {
+        self.sample == Sample::I16 && self.channels == 2
+    }
 }
 
 fn to16(v: f32) -> i16 {
@@ -282,7 +292,7 @@ fn to16(v: f32) -> i16 {
 
 /// 장치 형식의 소리를 16비트 스테레오로 바꿔 out 뒤에 붙인다.
 /// 1채널은 양쪽에 똑같이, 5.1·7.1은 가운데·뒤 스피커 소리를 양쪽에 섞는다.
-fn to_stereo16(fmt: &Format, data: &[u8], out: &mut Vec<i16>) {
+fn to_stereo16(fmt: &Format, data: &[u8], out: &mut Vec<u8>) {
     let n = fmt.sample_bytes();
     let read = |frame: &[u8], ch: usize| -> f32 {
         let b = &frame[ch * n..];
@@ -304,8 +314,8 @@ fn to_stereo16(fmt: &Format, data: &[u8], out: &mut Vec<i16>) {
                 (read(frame, 0) + center + read(frame, 4) * 0.707, read(frame, 1) + center + read(frame, 5) * 0.707)
             }
         };
-        out.push(to16(l));
-        out.push(to16(r));
+        out.extend_from_slice(&to16(l).to_le_bytes());
+        out.extend_from_slice(&to16(r).to_le_bytes());
     }
 }
 
@@ -322,10 +332,10 @@ unsafe fn mix_format(p: *const WAVEFORMATEX) -> Result<Format> {
             (1, 16) => Sample::I16,
             (1, 24) => Sample::I24,
             (1, 32) => Sample::I32,
-            _ => bail!("지원하지 않는 소리 형식입니다 (종류 {kind}, {bits}비트)"),
+            _ => return Err(anyhow!("지원하지 않는 소리 형식입니다 (종류 {kind}, {bits}비트)")),
         };
         if channels == 0 || rate == 0 {
-            bail!("소리 형식을 읽을 수 없습니다");
+            return Err(anyhow!("소리 형식을 읽을 수 없습니다"));
         }
         Ok(Format { sample, channels: channels as usize, rate })
     }
@@ -400,25 +410,25 @@ unsafe fn drain(s: &Session, mut f: impl FnMut(i64, &[u8], bool)) -> windows::co
             let mut data = std::ptr::null_mut();
             let (mut frames, mut flags, mut stamp) = (0u32, 0u32, 0u64);
             s.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut stamp))?;
-            let silent = flags & FLAG_SILENT != 0 || data.is_null();
+            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
             // 시각이 없거나 지금과 동떨어져 있으면 지금 시각에서 이 묶음 길이만큼 앞으로 본다
             let t = now();
             let length = frames as i64 * TICKS / s.fmt.rate as i64;
             let at = stamp as i64;
-            let at = if flags & FLAG_TIMESTAMP_ERROR != 0 || (t - at).abs() > 5 * TICKS { t - length } else { at };
+            let unsure = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 || (t - at).abs() > 5 * TICKS;
             let bytes: &[u8] =
                 if silent { &[] } else { std::slice::from_raw_parts(data, frames as usize * s.fmt.block()) };
-            f(at, bytes, silent);
+            f(if unsure { t - length } else { at }, bytes, silent);
             s.capture.ReleaseBuffer(frames)?;
         }
     }
 }
 
-fn capture_thread(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<u32>>) -> Result<u64> {
+fn capture_thread(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<()>>) -> Result<Captured> {
     unsafe {
         if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
             let _ = ready.send(Err(anyhow!("소리 기능을 준비할 수 없습니다: {e}")));
-            bail!("소리 기능 준비 실패");
+            return Ok((0, None));
         }
         let result = capture_loop(shared, path, ready);
         CoUninitialize();
@@ -426,28 +436,32 @@ fn capture_thread(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<u32>>
     }
 }
 
-unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<u32>>) -> Result<u64> {
+unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<()>>) -> Result<Captured> {
     unsafe {
-        let start = || -> Result<(IMMDeviceEnumerator, Session, Track)> {
+        let start = || -> Result<_> {
             let en: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).context("소리 장치 목록을 열 수 없습니다")?;
             let session = open(&en)?;
-            let track = Track::create(path, session.fmt.rate).context("소리 임시 파일을 만들 수 없습니다")?;
-            Ok((en, session, track))
+            // 받은 소리를 그때그때 AAC로 바꿔 줄 ffmpeg
+            let mut encoder = crate::export::aac_encoder(path, session.fmt.rate)?;
+            let input = encoder.stdin.take().ok_or_else(|| anyhow!("소리 변환을 시작할 수 없습니다"))?;
+            Ok((en, session, encoder, input))
         };
-        let (en, session, mut track) = match start() {
+        let (en, session, mut encoder, input) = match start() {
             Ok(v) => v,
             Err(e) => {
+                // 시작하지 못한 까닭은 start()가 기다리는 쪽으로 보낸다
                 let _ = ready.send(Err(e));
-                bail!("소리 녹음 시작 실패");
+                return Ok((0, None));
             }
         };
         let rate = session.fmt.rate;
-        let _ = ready.send(Ok(rate));
+        let mut track = Track::new(BufWriter::with_capacity(1 << 16, input), rate);
+        let _ = ready.send(Ok(()));
 
         let mut session = Some(session);
         let mut timeline = Timeline::default();
-        let mut pcm: Vec<i16> = vec![];
+        let mut converted: Vec<u8> = vec![];
         let mut checked = Instant::now();
         // 새 장치의 소리 빠르기가 달라 이어 받을 수 없게 됨
         let mut gave_up = false;
@@ -458,26 +472,31 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
             let stopping = shared.stop.load(Ordering::SeqCst);
             if let Some(s) = &session {
                 let drained = drain(s, |at, data, silent| {
-                    let mut marks = shared.marks.lock();
-                    while marks.front().is_some_and(|m| m.0 <= at) {
-                        if let Some((when, running)) = marks.pop_front() {
-                            timeline.mark(when, running);
-                        }
-                    }
-                    drop(marks);
+                    timeline.apply(&shared.marks, at);
                     if silent || write_failed {
                         return;
                     }
                     if let Some(pos) = timeline.at(at) {
-                        pcm.clear();
-                        to_stereo16(&s.fmt, data, &mut pcm);
-                        write_failed = track.put(pos, &pcm).is_err();
+                        let sound = if s.fmt.is_stereo16() {
+                            data
+                        } else {
+                            converted.clear();
+                            to_stereo16(&s.fmt, data, &mut converted);
+                            &converted[..]
+                        };
+                        write_failed = track.put(pos, sound).is_err();
                     }
                 });
                 if drained.is_err() {
                     // 장치가 사라졌다 (뽑힘, 꺼짐). 아래에서 새 기본 장치를 찾는다.
                     session = None;
                 }
+            }
+            // 조용해서 소리가 오지 않는 동안: 조금 지난 시각까지의 표시를 반영하고 무음을 채워 둔다
+            let settled = now() - SETTLED;
+            timeline.apply(&shared.marks, settled);
+            if !write_failed && let Some(pos) = timeline.at(settled) {
+                write_failed = track.catch_up(pos).is_err();
             }
             if stopping {
                 break;
@@ -500,16 +519,26 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(POLL);
         }
 
-        if write_failed {
-            *shared.warning.lock() = Some("소리 임시 파일을 쓰지 못해 소리가 중간에 끊겼습니다".into());
-        } else if gave_up || session.is_none() {
-            *shared.warning.lock() = Some("녹화 중 소리 장치가 바뀌어 일부 구간에 소리가 없습니다".into());
-        }
         let total = shared.total.lock().unwrap_or_default();
-        track.finish(total).context("소리 임시 파일을 마무리하지 못했습니다")
+        write_failed = write_failed || track.pad_to(total).is_err();
+        let frames = track.frames;
+        // 입력을 닫아야 ffmpeg가 파일을 마무리하고 끝난다
+        drop(track);
+        let encoded = encoder.wait().map(|s| s.success()).unwrap_or(false);
+        if !encoded {
+            return Err(anyhow!("소리를 변환하지 못했습니다"));
+        }
+        let warning = if write_failed {
+            Some("소리가 중간에 끊겼습니다".to_string())
+        } else if session.is_none() {
+            Some("녹화 중 소리 장치가 바뀌어 일부 구간에 소리가 없습니다".to_string())
+        } else {
+            None
+        };
+        Ok((frames, warning))
     }
 }
 
@@ -517,12 +546,13 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("opencam_audio_{}_{name}", std::process::id()))
+    /// 16비트 값들을 바이트로
+    fn bytes(v: &[i16]) -> Vec<u8> {
+        v.iter().flat_map(|s| s.to_le_bytes()).collect()
     }
 
-    fn read16(path: &Path) -> Vec<i16> {
-        std::fs::read(path).unwrap().chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
+    fn samples(b: &[u8]) -> Vec<i16> {
+        b.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
     }
 
     #[test]
@@ -544,68 +574,90 @@ mod tests {
     }
 
     #[test]
+    fn marks_are_applied_only_up_to_the_given_time() {
+        let marks: Marks = Mutex::new(VecDeque::from([(100, true), (200, false), (300, true)]));
+        let mut t = Timeline::default();
+        t.apply(&marks, 150);
+        assert_eq!(t.at(150), Some(50));
+        assert_eq!(marks.lock().len(), 2, "아직 오지 않은 시각의 표시는 남겨 둔다");
+        t.apply(&marks, 250);
+        assert_eq!(t.at(250), None);
+        t.apply(&marks, 400);
+        assert_eq!(t.at(400), Some(200));
+        assert!(marks.lock().is_empty());
+    }
+
+    #[test]
     fn track_fills_gaps_and_drops_overlap() {
-        let path = temp("track.raw");
         // 1초에 1000묶음: 1묶음 = 10,000틱, 허용 오차 50묶음
-        let mut track = Track::create(&path, 1000).unwrap();
-        track.put(0, &[1, 1, 2, 2]).unwrap();
+        let mut track = Track::new(Vec::new(), 1000);
+        track.put(0, &bytes(&[1, 1, 2, 2])).unwrap();
         // 거의 이어지는 소리(10묶음 차이)는 그대로 붙인다
-        track.put(12 * 10_000, &[3, 3]).unwrap();
+        track.put(12 * 10_000, &bytes(&[3, 3])).unwrap();
         assert_eq!(track.frames, 3);
         // 100묶음 자리에 오면 그 사이를 무음으로 채운다
-        track.put(100 * 10_000, &[4, 4]).unwrap();
+        track.put(100 * 10_000, &bytes(&[4, 4])).unwrap();
         assert_eq!(track.frames, 101);
-        // 파일 끝(101)보다 60묶음 앞선 자리(41)에 온 소리는 겹친 만큼 버린다
+        // 지금까지 보낸 끝(101)보다 60묶음 앞선 자리(41)에 온 소리는 겹친 만큼 버린다
         let late: Vec<i16> = (0..70).flat_map(|i| [100 + i, 100 + i]).collect();
-        track.put(41 * 10_000, &late).unwrap();
+        track.put(41 * 10_000, &bytes(&late)).unwrap();
         assert_eq!(track.frames, 111);
         // 전체 길이 0.2초(200묶음)에 맞추면 뒤는 무음
-        assert_eq!(track.finish(Duration::from_millis(200)).unwrap(), 200);
-        let s = read16(&path);
+        track.pad_to(Duration::from_millis(200)).unwrap();
+        assert_eq!(track.frames, 200);
+        let s = samples(&track.out);
         assert_eq!(s.len(), 400);
         assert_eq!(&s[..6], &[1, 1, 2, 2, 3, 3]);
         assert!(s[6..200].iter().all(|v| *v == 0));
         assert_eq!(&s[200..204], &[4, 4, 160, 160], "겹친 60묶음은 버리고 61번째부터");
         assert_eq!(s[221], 169);
         assert!(s[222..].iter().all(|v| *v == 0));
-        let _ = std::fs::remove_file(&path);
+        // 이미 더 길면 그대로 둔다 (넘치는 것은 영상에 넣을 때 자른다)
+        track.pad_to(Duration::from_millis(100)).unwrap();
+        assert_eq!(track.frames, 200);
     }
 
     #[test]
-    fn track_cuts_what_is_longer_than_the_video() {
-        let path = temp("cut.raw");
-        let mut track = Track::create(&path, 1000).unwrap();
-        track.put(0, &[7; 600]).unwrap();
-        assert_eq!(track.finish(Duration::from_millis(100)).unwrap(), 100);
-        assert_eq!(read16(&path), vec![7; 200]);
-        let _ = std::fs::remove_file(&path);
+    fn quiet_stretches_are_filled_while_recording() {
+        let mut track = Track::new(Vec::new(), 1000);
+        // 0.4초 뒤처진 것은 그냥 둔다 (곧 올 소리가 제자리에 놓이게)
+        track.catch_up(400 * 10_000).unwrap();
+        assert_eq!(track.frames, 0);
+        // 0.5초 넘게 뒤처지면 그 시각까지 무음
+        track.catch_up(900 * 10_000).unwrap();
+        assert_eq!(track.frames, 900);
+        // 그 뒤에 온 소리는 제자리(1000)에
+        track.put(1000 * 10_000, &bytes(&[5, 5])).unwrap();
+        assert_eq!(track.frames, 1001);
+        assert_eq!(&samples(&track.out)[2000..], &[5, 5]);
     }
 
     #[test]
     fn device_formats_become_16_bit_stereo() {
-        let mut out = vec![];
+        let convert = |f: Format, data: &[u8]| {
+            let mut out = vec![];
+            to_stereo16(&f, data, &mut out);
+            samples(&out)
+        };
         // 실수 2채널: 범위를 넘으면 끝값으로
-        let f = Format { sample: Sample::F32, channels: 2, rate: 48000 };
         let data: Vec<u8> = [0.5f32, -0.5, 2.0, -2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        to_stereo16(&f, &data, &mut out);
-        assert_eq!(out, [16384, -16384, 32767, -32767]);
+        let f = Format { sample: Sample::F32, channels: 2, rate: 48000 };
+        assert!(!f.is_stereo16());
+        assert_eq!(convert(f, &data), [16384, -16384, 32767, -32767]);
         // 16비트 1채널: 양쪽에 똑같이
-        out.clear();
         let f = Format { sample: Sample::I16, channels: 1, rate: 44100 };
-        to_stereo16(&f, &1000i16.to_le_bytes(), &mut out);
-        assert_eq!(out, [1000, 1000]);
+        assert!(!f.is_stereo16());
+        assert_eq!(convert(f, &1000i16.to_le_bytes()), [1000, 1000]);
         // 24비트 2채널: 음수 부호가 살아야 한다
-        out.clear();
         let f = Format { sample: Sample::I24, channels: 2, rate: 48000 };
-        to_stereo16(&f, &[0x00, 0x00, 0x40, 0x00, 0x00, 0xC0], &mut out);
-        assert_eq!(out, [16384, -16384]);
+        assert_eq!(convert(f, &[0x00, 0x00, 0x40, 0x00, 0x00, 0xC0]), [16384, -16384]);
         // 5.1: 가운데 소리가 양쪽에 섞인다
-        out.clear();
-        let f = Format { sample: Sample::F32, channels: 6, rate: 48000 };
         let data: Vec<u8> = [0.0f32, 0.0, 0.5, 0.9, 0.0, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        to_stereo16(&f, &data, &mut out);
+        let out = convert(Format { sample: Sample::F32, channels: 6, rate: 48000 }, &data);
         assert_eq!(out[0], out[1]);
         assert!((out[0] - 11583).abs() <= 1, "{}", out[0]);
+        // 16비트 2채널은 바꿀 것이 없다
+        assert!(Format { sample: Sample::I16, channels: 2, rate: 48000 }.is_stereo16());
     }
 
     #[test]
@@ -625,10 +677,13 @@ mod tests {
         assert!(unsafe { mix_format(raw.as_ptr() as *const WAVEFORMATEX) }.is_err());
     }
 
-    /// 이 PC의 실제 출력 장치에서 잠깐 받아 본다. 장치가 없으면(원격 접속 등) 건너뛴다.
+    /// 이 PC의 실제 출력 장치에서 잠깐 받아 본다. ffmpeg나 장치가 없으면(원격 접속 등) 건너뛴다.
     #[test]
-    fn real_device_gives_a_file_of_the_asked_length() {
-        let path = temp("real.raw");
+    fn real_device_gives_a_sound_file_of_the_asked_length() {
+        if crate::export::find_ffmpeg().is_none() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("opencam_audio_{}_real.tmp", std::process::id()));
         let cap = match AudioCapture::start(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -637,14 +692,29 @@ mod tests {
             }
         };
         cap.mark(now(), true);
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(600));
         cap.mark(now(), false);
-        let file = cap.finish(Duration::from_millis(300)).unwrap();
-        assert!(file.rate >= 8000, "{}", file.rate);
-        assert_eq!(file.frames, (0.3 * file.rate as f64).round() as u64);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), file.frames * 4);
+        let file = cap.finish(Duration::from_millis(600)).unwrap();
+        // 0.6초는 채우고, 넘쳐도 조금만
+        assert!(file.frames >= 8000 * 6 / 10, "{}", file.frames);
         assert_eq!(file.warning, None);
+        let (has_audio, secs) = crate::export::probe_audio(&path);
+        assert!(has_audio);
+        assert!((0.55..0.8).contains(&secs), "{secs}초");
         drop(file);
         assert!(!path.exists(), "다 쓴 소리 파일은 지운다");
+    }
+
+    #[test]
+    fn a_capture_that_never_finished_leaves_no_file() {
+        if crate::export::find_ffmpeg().is_none() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("opencam_audio_{}_dropped.tmp", std::process::id()));
+        let Ok(cap) = AudioCapture::start(&path) else {
+            return;
+        };
+        drop(cap);
+        assert!(!path.exists());
     }
 }

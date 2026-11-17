@@ -249,8 +249,8 @@ body,
 }
 
 /* 영역 목록: 목록에서 가장 긴 글자만큼 넓어지지 않게, 두 글자("영역"·"전체")만 보인다 */
-.rec-dd.narrow select {
-  width: 40px;
+.rec-dd select.narrow {
+  width: 42px;
 }
 
 .rec-dd select:focus {
@@ -370,23 +370,19 @@ body,
 /* 빈칸. 안에 스위치(MP4 저장·녹음·커서)를 차례로 놓는다 (Recorder.tsx의 reveal).
    rec-spacer·rec-more: 묶음이 한 줄에 안 들어가면 아랫줄로 넘어가 가려진다.
    rec-group: 스위치 하나 + 그 뒤에 올 것들(rec-more). 스위치가 이름까지 다 보인 뒤 남는 자리가 rec-more 몫이다. */
-.rec-spacer {
-  flex: 1;
-  min-width: 8px;
-}
-
-.rec-more {
-  flex: 1 1 0;
-  min-width: 0;
-}
-
 .rec-spacer,
 .rec-more {
+  flex: 1;
+  min-width: 0;
   height: 100%;
   display: flex;
   flex-wrap: wrap;
   align-content: flex-start;
   overflow: hidden;
+}
+
+.rec-spacer {
+  min-width: 8px;
 }
 
 /* 너비 0인 첫 칸. 첫 줄 높이를 채워 줘야 아랫줄로 넘어간 묶음이 보이는 곳 밖으로 밀린다. */
@@ -396,7 +392,10 @@ body,
   height: 100%;
 }
 
-/* 이름 없이 "아이콘 + 토글"만 들어갈 너비(70px)가 있으면 나온다 */
+/* 아래 숫자는 스위치 크기에서 나온다 (.rec-switch를 바꾸면 같이 바꾼다):
+   이름 없는 스위치 60px = 양옆 여백 8 + 아이콘 16 + 간격 6 + 토글 30. 첫 스위치는 세로줄 몫 9px를 더한다.
+   - 70px(첫 스위치 79px): 이름 없는 스위치 + 뒤 간격 4 + 여유 6. 이만큼 있으면 나온다.
+   - 89px(첫 스위치 98px): 이름이 "한 글자…"(약 20px)로 보일 만한 너비. 이보다 좁으면 이름을 뺀다. */
 .rec-group {
   flex: 1 1 0;
   min-width: 70px;

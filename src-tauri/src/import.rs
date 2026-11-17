@@ -1,6 +1,8 @@
 //! 파일 열기: GIF·WebP·APNG(움직이는 그림), 일반 이미지 여러 장, 동영상(ffmpeg).
 
-use crate::export::{Progress, STDERR_TAIL, find_ffmpeg, spawn_stderr_tail};
+#[cfg(test)]
+use crate::export::find_ffmpeg;
+use crate::export::{Progress, STDERR_TAIL, spawn_stderr_tail};
 use crate::frame::{Frame, MAX_FRAME_BYTES, import_rgba_len};
 use crate::project::resize_rgba;
 use anyhow::{Context, Result, anyhow, bail};
@@ -254,15 +256,7 @@ pub struct VideoInfo {
 }
 
 fn ffmpeg_command() -> Result<Command> {
-    let ffmpeg =
-        find_ffmpeg().ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. 동영상을 열려면 ffmpeg가 필요합니다."))?;
-    let mut cmd = Command::new(ffmpeg);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    Ok(cmd)
+    crate::export::ffmpeg().ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. 동영상을 열려면 ffmpeg가 필요합니다."))
 }
 
 /// `ffmpeg -i`가 알려 주는 정보에서 크기·길이·FPS를 읽는다 (ffprobe 없이)
@@ -272,7 +266,7 @@ pub fn parse_ffmpeg_info(text: &str) -> Option<VideoInfo> {
     parse_ffmpeg_info_inner(text).map(|(info, _)| info)
 }
 
-fn parse_ffmpeg_timestamp(text: &str) -> Option<u64> {
+pub(crate) fn parse_ffmpeg_timestamp(text: &str) -> Option<u64> {
     let mut parts = text.trim().split(':');
     let h: u64 = parts.next()?.parse().ok()?;
     let m: u32 = parts.next()?.parse().ok()?;
