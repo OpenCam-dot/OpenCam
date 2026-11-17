@@ -3,6 +3,7 @@
 //! - "화면 변화 없으면 프레임 합치기": 새 화면이 직전과 완전히 같으면 직전 프레임 시간만 늘린다
 //! - 프레임 시간은 실제로 흐른 시간으로 정한다(캡처가 밀려도 재생 속도가 실제와 같게)
 
+use crate::audio::{self, AudioCapture};
 use crate::capture::{Capturer, CursorOptions, Rect};
 use crate::export::Mp4Stream;
 use crate::frame::Frame;
@@ -23,6 +24,8 @@ pub struct RecordOptions {
     pub cursor: CursorOptions,
     /// 녹화하면서 MP4로 바로 저장
     pub direct: Option<Mp4Stream>,
+    /// 바로 저장하는 MP4에 넣을 PC 소리 (direct가 있을 때만 쓴다)
+    pub audio: Option<AudioCapture>,
     /// 바로 저장 중 메모리 한도에 닿으면 편집용 프레임만 그만 모으고 녹화는 계속
     pub drop_frames_after_limit: bool,
 }
@@ -32,6 +35,8 @@ pub struct RecordResult {
     pub frames: Vec<Frame>,
     /// MP4 바로 저장 결과 (저장한 파일 또는 오류)
     pub direct: Option<Result<PathBuf, String>>,
+    /// 소리를 넣다가 생긴 문제 (MP4는 저장됐지만 소리가 없거나 일부만 있음)
+    pub audio_warning: Option<String>,
     /// 메모리 한도 때문에 편집용 프레임을 중간부터 버렸으면 true
     pub dropped: bool,
 }
@@ -55,6 +60,7 @@ struct Shared {
     paused: AtomicBool,
     region: Mutex<Option<Rect>>,
     direct_result: Mutex<Option<Result<PathBuf, String>>>,
+    audio_warning: Mutex<Option<String>>,
     dropped: AtomicBool,
 }
 
@@ -90,6 +96,7 @@ impl Recorder {
             paused: AtomicBool::new(false),
             region: Mutex::new(None),
             direct_result: Mutex::new(None),
+            audio_warning: Mutex::new(None),
             dropped: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -130,6 +137,7 @@ impl Recorder {
         RecordResult {
             frames: std::mem::take(&mut *self.shared.frames.lock()),
             direct: self.shared.direct_result.lock().take(),
+            audio_warning: self.shared.audio_warning.lock().take(),
             dropped: self.shared.dropped.load(Ordering::SeqCst),
         }
     }
@@ -167,6 +175,8 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     let mut next = Instant::now();
     let mut last_px: Option<Arc<Vec<u8>>> = None;
     let direct = opts.direct.take();
+    // 소리는 MP4에만 넣는다. 녹화 시간이 흐르기 시작한 때와 멈춘 때를 알려 줘 영상과 맞춘다.
+    let audio = if direct.is_some() { opts.audio.take() } else { None };
     // MP4에 넣은 프레임 수. 녹화 시간 × FPS만큼 되도록 맞춰 넣는다.
     let mut written = 0u64;
     // 메모리 한도 뒤로는 편집용 프레임을 모으지 않는다 (바로 저장일 때)
@@ -197,6 +207,9 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
                     extend_last(&s, dt);
                 }
                 recorded += dt;
+                if let Some(a) = &audio {
+                    a.mark(audio::now(), false);
+                }
             }
             std::thread::sleep(Duration::from_millis(15));
             next = Instant::now();
@@ -205,6 +218,7 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         }
 
         let now = Instant::now();
+        let now_audio = audio::now();
         if now < next {
             std::thread::sleep((next - now).min(Duration::from_millis(5)));
             continue;
@@ -229,6 +243,9 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
                 extend_last(&s, dt);
             }
             recorded += dt;
+        } else if let Some(a) = &audio {
+            // 녹화 시간은 이 캡처부터 흐른다 (처음, 또는 일시정지가 풀린 뒤)
+            a.mark(now_audio, true);
         }
         if let Some(d) = &direct {
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64 + 1;
@@ -281,8 +298,23 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         if let Some(px) = &last_px {
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64;
             d.push(px.clone(), target.saturating_sub(written) as u32);
+            written = written.max(target);
         }
-        *s.direct_result.lock() = Some(d.finish().map_err(|e| format!("{e:#}")));
+        let saved = d.finish().map_err(|e| format!("{e:#}"));
+        if let Some(a) = audio {
+            // 소리 길이를 영상 길이(넣은 프레임 수)에 맞춘 뒤 MP4에 넣는다
+            let total = Duration::from_secs_f64(written as f64 / fps as f64);
+            let warning = match (a.finish(total), &saved) {
+                (Ok(file), Ok(path)) if file.frames > 0 => crate::export::mux_audio(path, &file.path, file.rate)
+                    .err()
+                    .map(|e| format!("소리를 영상에 넣지 못했습니다 ({e:#})"))
+                    .or_else(|| file.warning.clone()),
+                (Ok(_), _) => None,
+                (Err(e), _) => Some(format!("소리를 녹음하지 못했습니다 ({e:#})")),
+            };
+            *s.audio_warning.lock() = warning;
+        }
+        *s.direct_result.lock() = Some(saved);
     }
     if let Some(last) = s.frames.lock().last_mut() {
         last.delay_ms = last.delay_ms.max(interval.as_millis() as u32);
@@ -360,6 +392,7 @@ mod tests {
                 right_color: 0,
             },
             direct: Some(Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80).unwrap()),
+            audio: None,
             drop_frames_after_limit: true,
         };
         let rec = Recorder::spawn(FakeScreen(0), opts, |_| {}).unwrap();
@@ -374,6 +407,56 @@ mod tests {
         assert_eq!(result.frames.len(), 1);
         // 예전에는 편집용 프레임을 그만 모은 뒤의 녹화 시간(약 0.6초)이 모두 이 프레임에 더해졌다
         assert!(result.frames[0].delay_ms < 300, "{}ms", result.frames[0].delay_ms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 소리와 함께 바로 저장: 일시정지를 섞어도 MP4에 소리가 들어가고 길이가 영상과 같다.
+    /// ffmpeg나 소리 장치가 없으면 건너뛴다.
+    #[test]
+    fn direct_recording_with_sound_has_an_audio_track_as_long_as_the_video() {
+        if crate::export::find_ffmpeg().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("opencam_direct_audio_{}", std::process::id()));
+        let direct = Mp4Stream::start(&dir.join("d.mp4"), 4, 4, 50, 80).unwrap();
+        let Ok(sound) = AudioCapture::start(&dir.join("d.audio.tmp")) else {
+            eprintln!("소리 장치가 없어 건너뜀");
+            let _ = direct.finish();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let opts = RecordOptions {
+            region: Rect { x: 0, y: 0, w: 4, h: 4 },
+            fps: 50,
+            skip_same_frame: false,
+            max_ms: None,
+            max_bytes: usize::MAX,
+            cursor: CursorOptions {
+                draw: false,
+                highlight: false,
+                highlight_color: 0,
+                click_fx: false,
+                left_color: 0,
+                right_color: 0,
+            },
+            direct: Some(direct),
+            audio: Some(sound),
+            drop_frames_after_limit: true,
+        };
+        let rec = Recorder::spawn(FakeScreen(0), opts, |_| {}).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        rec.set_paused(true);
+        std::thread::sleep(Duration::from_millis(400));
+        rec.set_paused(false);
+        std::thread::sleep(Duration::from_millis(500));
+        let result = rec.stop();
+        assert_eq!(result.audio_warning, None);
+        let path = result.direct.unwrap().unwrap();
+        let (has_audio, secs) = crate::export::probe_audio(&path);
+        assert!(has_audio);
+        // 일시정지 0.4초는 빠지고 약 1초
+        assert!((0.8..1.3).contains(&secs), "{secs}초");
+        assert!(!dir.join("d.audio.tmp").exists(), "소리 임시 파일을 남기지 않는다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

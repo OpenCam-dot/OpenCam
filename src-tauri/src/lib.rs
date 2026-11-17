@@ -1,5 +1,6 @@
 //! OpenCam 본체: 창 두 개(녹화 틀 "recorder", 편집 "main")와 화면에서 부르는 명령들.
 
+mod audio;
 mod capture;
 mod collage;
 mod effects;
@@ -392,6 +393,15 @@ fn start_recording(app: &AppHandle) -> CmdResult<()> {
     } else {
         None
     };
+    // 바로 저장하는 MP4에 PC 소리도 넣기. 소리 장치를 못 열면 소리 없이 녹화한다.
+    let audio = match &direct {
+        Some(d) if s.rec_direct_save_audio => audio::AudioCapture::start(&d.path.with_extension("audio.tmp"))
+            .inspect_err(|e| {
+                let _ = app.emit("notice", format!("소리를 녹음할 수 없어 소리 없이 녹화합니다 ({e:#})"));
+            })
+            .ok(),
+        _ => None,
+    };
     let no_limit = s.rec_no_time_limit || (direct.is_some() && s.rec_direct_save_no_time_limit);
     let opts = RecordOptions {
         region,
@@ -399,6 +409,7 @@ fn start_recording(app: &AppHandle) -> CmdResult<()> {
         skip_same_frame: s.skip_same_frame,
         max_ms: (!no_limit).then(|| s.max_rec_sec.clamp(1, 3600) as u64 * 1000),
         direct,
+        audio,
         drop_frames_after_limit: s.rec_direct_save_drop_frames,
         max_bytes: s.max_edit_bytes(),
         cursor: CursorOptions {
@@ -455,7 +466,14 @@ fn finish_recording(app: &AppHandle) {
     match &result.direct {
         Some(Ok(path)) => {
             direct_saved = true;
-            let _ = app.emit("notice", format!("MP4로 저장했습니다: {}", path.display()));
+            // 소리에 문제가 있었으면 같은 알림에 함께 알린다 (알림은 한 번에 하나만 보인다)
+            let _ = app.emit(
+                "notice",
+                match &result.audio_warning {
+                    Some(w) => format!("MP4로 저장했습니다. {w}: {}", path.display()),
+                    None => format!("MP4로 저장했습니다: {}", path.display()),
+                },
+            );
             if state.settings.lock().rec_direct_save_open_folder {
                 let _ = tauri_plugin_opener::reveal_item_in_dir(path);
             }

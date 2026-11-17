@@ -49,6 +49,7 @@ export interface Settings {
   hotkeyCtrlPrtsc: boolean;
   maxEditMemoryMb: number;
   recDirectSave: boolean;
+  recDirectSaveAudio: boolean;
   recDirectSaveQuality: number;
   recDirectSaveOpenFolder: boolean;
   recDirectSaveDropFrames: boolean;

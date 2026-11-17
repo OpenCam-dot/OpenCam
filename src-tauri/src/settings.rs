@@ -42,8 +42,10 @@ pub struct Settings {
     pub hotkey_pause: String,
     pub hotkey_ctrl_prtsc: bool,
     pub max_edit_memory_mb: u32,
-    /// 녹화 중 MP4로 바로 저장 (소리 없음)
+    /// 녹화 중 MP4로 바로 저장
     pub rec_direct_save: bool,
+    /// 바로 저장하는 MP4에 PC에서 나는 소리도 넣는다 (편집 창으로 가는 프레임에는 소리가 없다)
+    pub rec_direct_save_audio: bool,
     pub rec_direct_save_quality: u8,
     pub rec_direct_save_open_folder: bool,
     /// 메모리 한도에 닿으면 편집용 프레임은 버리고 MP4 저장은 계속
@@ -174,6 +176,7 @@ impl Default for Settings {
             hotkey_ctrl_prtsc: false,
             max_edit_memory_mb: 4096,
             rec_direct_save: false,
+            rec_direct_save_audio: false,
             rec_direct_save_quality: 90,
             rec_direct_save_open_folder: true,
             rec_direct_save_drop_frames: true,

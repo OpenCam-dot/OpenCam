@@ -184,7 +184,13 @@ export default function SettingsDialog({ settings, onClose, onSaved }: Props) {
                   />
                 </Section>
                 <Section title="MP4 바로 저장">
-                  <Check label="녹화 중 MP4로 바로 저장하기 (소리 없음)" checked={s.recDirectSave} onChange={(v) => set("recDirectSave", v)} />
+                  <Check label="녹화 중 MP4로 바로 저장하기" checked={s.recDirectSave} onChange={(v) => set("recDirectSave", v)} />
+                  <Check
+                    label="PC에서 나는 소리도 MP4에 넣기 (편집 창으로 가는 녹화에는 소리가 없습니다)"
+                    checked={s.recDirectSaveAudio}
+                    disabled={!s.recDirectSave}
+                    onChange={(v) => set("recDirectSaveAudio", v)}
+                  />
                   <Field label="품질" sub>
                     <NumInput
                       value={s.recDirectSaveQuality}

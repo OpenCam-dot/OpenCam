@@ -1268,6 +1268,41 @@ impl Mp4Stream {
     }
 }
 
+/// 소리 없는 MP4에 소리(16비트 스테레오, 헤더 없는 파일)를 넣는다. 영상은 다시 만들지 않고 그대로 옮긴다.
+/// 실패하면 원래 MP4는 그대로 남는다.
+pub fn mux_audio(video: &Path, audio: &Path, rate: u32) -> Result<()> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow!("ffmpeg를 찾을 수 없습니다"))?;
+    // 새 파일로 만든 뒤 성공했을 때만 원래 파일과 바꾼다
+    let tmp = video.with_extension("mux.tmp");
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(video)
+        .args(["-f", "s16le", "-ar", &rate.to_string(), "-ac", "2", "-i"])
+        .arg(audio)
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"])
+        // AAC는 48000Hz까지가 무난하다
+        .args(["-c:a", "aac", "-b:a", "160k", "-ar", &rate.min(48000).to_string()])
+        .args(["-movflags", "+faststart", "-f", "mp4"])
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let status = cmd.status().context("ffmpeg 실행 실패")?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("ffmpeg 종료 코드 {:?}", status.code());
+    }
+    std::fs::rename(&tmp, video).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
 /// 투명한 부분을 배경색(RGB, `bgr()`로 바꾼 값) 위에 합성한다 (MP4는 투명을 지원하지 않는다)
 fn composite_over(px: &mut [u8], rgb: [u8; 3]) {
     for p in px.chunks_exact_mut(4) {
@@ -1398,9 +1433,62 @@ pub(crate) fn composite_gif(bytes: &[u8]) -> Vec<CompositedGifFrame> {
     out
 }
 
+/// 테스트용: 동영상 파일에 소리 줄기가 있는지, 길이가 몇 초인지 ffmpeg에게 물어본다
+#[cfg(test)]
+pub fn probe_audio(path: &Path) -> (bool, f64) {
+    let out = Command::new(find_ffmpeg().unwrap()).args(["-hide_banner", "-i"]).arg(path).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    // "Duration: 00:00:01.00, ..."
+    let secs = text
+        .split("Duration: ")
+        .nth(1)
+        .and_then(|t| t.split(',').next())
+        .map(|t| t.trim().split(':').fold(0.0, |acc, part| acc * 60.0 + part.parse::<f64>().unwrap_or(0.0)))
+        .unwrap_or(0.0);
+    (text.contains("Audio: aac"), secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mux_audio_adds_a_sound_track_without_touching_the_picture() {
+        if find_ffmpeg().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("opencam_mux_{}", std::process::id()));
+        // 1초짜리 영상 (10fps, 10장)
+        let video = dir.join("v.mp4");
+        let stream = Mp4Stream::start(&video, 16, 16, 10, 80).unwrap();
+        for i in 0..10u8 {
+            stream.push(std::sync::Arc::new(vec![i * 20; 16 * 16 * 4]), 1);
+        }
+        stream.finish().unwrap();
+        assert_eq!(probe_audio(&video).0, false);
+        let before = std::fs::metadata(&video).unwrap().len();
+        // 1초짜리 소리 (48000Hz 스테레오, 440Hz 음)
+        let audio = dir.join("a.raw");
+        let pcm: Vec<u8> = (0..48000)
+            .flat_map(|i| {
+                let v = ((i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 8000.0) as i16;
+                [v.to_le_bytes(), v.to_le_bytes()].concat()
+            })
+            .collect();
+        std::fs::write(&audio, pcm).unwrap();
+        mux_audio(&video, &audio, 48000).unwrap();
+        let (has_audio, secs) = probe_audio(&video);
+        assert!(has_audio);
+        assert!((secs - 1.0).abs() < 0.15, "{secs}초");
+        assert!(std::fs::metadata(&video).unwrap().len() > before);
+        assert!(!video.with_extension("mux.tmp").exists(), "임시 파일을 남기지 않는다");
+        // 소리 파일이 없으면 실패하고, 원래 영상은 그대로 남는다
+        let kept = std::fs::read(&video).unwrap();
+        assert!(mux_audio(&video, &dir.join("none.raw"), 48000).is_err());
+        assert_eq!(std::fs::read(&video).unwrap(), kept);
+        assert!(!video.with_extension("mux.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     static ESTIMATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
