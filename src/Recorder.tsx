@@ -575,7 +575,7 @@ export default function Recorder() {
   };
   const state = recording ? (status?.paused ? "paused" : "recording") : "idle";
   // 툴바 너비에 따라 단계적으로 줄인다. (기준은 각 단계 버튼들이 다 들어가는 너비)
-  //  1080 이상: 모두 / 760 이상: 커서·MP4 스위치, 열기, 설정은 ☰ 메뉴로
+  //  1080 이상: 모두 / 760 이상: 열기, 설정은 ☰ 메뉴로 (MP4 저장·녹음·커서 스위치는 남는 자리만큼 보인다)
   //  560 이상: 단축키 글자를 빼고 영역은 아이콘만 / 그보다 좁으면: 영역·FPS 모두 아이콘 버튼
   const barW = css(layout.bar.w);
   const wide = barW >= 1080;
@@ -666,6 +666,24 @@ export default function Recorder() {
         {select}
         <IconChevronDown size={14} className="chev" />
       </label>
+    );
+
+  // 스위치를 앞에서부터 차례로 드러낸다 (모양은 recorder.css).
+  // 자리가 조금 생기면 첫 스위치가 "아이콘 M… 토글"로 나오고, 넓어질수록 이름이 드러난다.
+  // 이름이 다 보인 뒤 남는 자리가 생기면 그다음 스위치가 같은 식으로 나온다. 좁아질 때는 거꾸로.
+  // 안 보이는 스위치도 ☰ 메뉴에는 늘 있다.
+  const reveal = (items: React.ReactNode[]): React.ReactNode =>
+    items.length === 0 ? null : (
+      <>
+        {/* 너비 0인 첫 칸: 이게 있어야 자리가 없을 때 묶음이 아랫줄로 넘어가 통째로 가려진다 */}
+        <i className="rec-wrap" />
+        <span className="rec-group" data-tauri-drag-region={drag}>
+          {items[0]}
+          <span className="rec-more" data-tauri-drag-region={drag}>
+            {reveal(items.slice(1))}
+          </span>
+        </span>
+      </>
     );
 
   const commitSize = () => {
@@ -803,43 +821,43 @@ export default function Recorder() {
               ) : (
                 pick(<IconGauge size={16} />, `초당 프레임 수 ${settings.fps} FPS`, !small, fpsSelect, false)
               )}
-              {wide && (
-                <>
-                  <span className="rec-sep" />
-                  <label className="rec-switch" title="마우스 커서 녹화">
-                    <IconPointer size={16} />
-                    커서
-                    <input
-                      type="checkbox"
-                      checked={settings.captureCursor}
-                      onChange={(e) => saveSettings({ ...settings, captureCursor: e.target.checked })}
-                    />
-                    <i />
-                  </label>
-                  <label className="rec-switch" title="녹화하면서 MP4 파일로 바로 저장">
-                    <IconMovie size={16} />
-                    MP4 저장
-                    <input
-                      type="checkbox"
-                      checked={settings.recDirectSave}
-                      onChange={(e) => saveSettings({ ...settings, recDirectSave: e.target.checked })}
-                    />
-                    <i />
-                  </label>
-                  {/* 소리는 바로 저장하는 MP4에만 들어가므로, 녹음을 켜면 MP4 저장도 같이 켠다 */}
-                  <label className="rec-switch" title="PC에서 나는 소리도 MP4에 넣기 (MP4 저장이 함께 켜집니다)">
-                    <IconVolume size={16} />
-                    녹음
-                    <input type="checkbox" checked={soundOn} onChange={(e) => saveSettings(withSound(e.target.checked))} />
-                    <i />
-                  </label>
-                </>
-              )}
             </>
           )}
 
         </div>
-        <span className="rec-spacer" data-tauri-drag-region={drag} />
+        {/* 빈칸(끌어서 옮기는 자리). 쉬는 중에는 여기에 스위치를 놓는다 (자리가 모자라면 줄어든다, 위 reveal). */}
+        <span className="rec-spacer" data-tauri-drag-region={drag}>
+          {!recording &&
+            reveal([
+              <label className="rec-switch" title="녹화하면서 MP4 파일로 바로 저장">
+                <IconMovie size={16} />
+                <span>MP4 저장</span>
+                <input
+                  type="checkbox"
+                  checked={settings.recDirectSave}
+                  onChange={(e) => saveSettings({ ...settings, recDirectSave: e.target.checked })}
+                />
+                <i />
+              </label>,
+              // 소리는 바로 저장하는 MP4에만 들어가므로, 녹음을 켜면 MP4 저장도 같이 켠다
+              <label className="rec-switch" title="PC에서 나는 소리도 MP4에 넣기 (MP4 저장이 함께 켜집니다)">
+                <IconVolume size={16} />
+                <span>녹음</span>
+                <input type="checkbox" checked={soundOn} onChange={(e) => saveSettings(withSound(e.target.checked))} />
+                <i />
+              </label>,
+              <label className="rec-switch" title="마우스 커서 녹화">
+                <IconPointer size={16} />
+                <span>커서</span>
+                <input
+                  type="checkbox"
+                  checked={settings.captureCursor}
+                  onChange={(e) => saveSettings({ ...settings, captureCursor: e.target.checked })}
+                />
+                <i />
+              </label>,
+            ])}
+        </span>
         {windowChoices && !recording && (
           <select
             className="rec-select"
