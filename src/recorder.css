@@ -396,18 +396,20 @@ body,
   height: 100%;
 }
 
-/* "아이콘 + 이름 한 글자… + 토글" 너비(88px)가 있어야 나온다 */
+/* 이름 없이 "아이콘 + 토글"만 들어갈 너비(70px)가 있으면 나온다 */
 .rec-group {
   flex: 1 1 0;
-  min-width: 88px;
+  min-width: 70px;
   height: 100%;
   display: flex;
   align-items: center;
   column-gap: 4px;
   overflow: hidden;
+  /* 아래에서 이 묶음의 너비를 보고 이름을 숨길지 정한다 */
+  container: rec-group / inline-size;
 }
 
-/* 자리가 모자라면 스위치가 줄어들며 이름이 …으로 끝난다 */
+/* 자리가 모자라면 스위치가 줄어들며 이름이 …으로 끝나고, 더 모자라면 이름 없이 아이콘과 토글만 남는다 */
 .rec-group > .rec-switch {
   flex: 0 1 auto;
   min-width: 0;
@@ -416,7 +418,21 @@ body,
 
 /* 첫 스위치 앞에는 앞 칸(영역·FPS)과 나누는 세로줄. 그만큼 더 넓어야 나온다. */
 .rec-spacer > .rec-group {
-  min-width: 97px;
+  min-width: 79px;
+  container-name: rec-group-first;
+}
+
+/* 이름이 "한 글자…"도 못 들어갈 만큼 좁으면 글자 조각이 보이지 않게 이름을 아예 뺀다 (아이콘과 토글만) */
+@container rec-group (max-width: 89px) {
+  .rec-switch > span {
+    display: none;
+  }
+}
+
+@container rec-group-first (max-width: 98px) {
+  .rec-switch > span {
+    display: none;
+  }
 }
 
 .rec-spacer > .rec-group > .rec-switch::before {
