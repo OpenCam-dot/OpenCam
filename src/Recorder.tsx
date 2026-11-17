@@ -10,7 +10,6 @@ import {
   IconCamera,
   IconCheck,
   IconChevronDown,
-  IconDimensions,
   IconFolderOpen,
   IconGauge,
   IconGripVertical,
@@ -22,6 +21,7 @@ import {
   IconPlayerStopFilled,
   IconPointer,
   IconSettings,
+  IconVolume,
   IconX,
 } from "@tabler/icons-react";
 import { api, errText, formatMs, CaptureWindow, RecStatus, Rect, Settings } from "./api";
@@ -576,7 +576,7 @@ export default function Recorder() {
   const state = recording ? (status?.paused ? "paused" : "recording") : "idle";
   // 툴바 너비에 따라 단계적으로 줄인다. (기준은 각 단계 버튼들이 다 들어가는 너비)
   //  1080 이상: 모두 / 760 이상: 커서·MP4 스위치, 열기, 설정은 ☰ 메뉴로
-  //  560 이상: 단축키 글자를 빼고 영역은 아이콘만 / 그보다 좁으면: 영역·크기·FPS 모두 아이콘 버튼
+  //  560 이상: 단축키 글자를 빼고 영역은 아이콘만 / 그보다 좁으면: 영역·FPS 모두 아이콘 버튼
   const barW = css(layout.bar.w);
   const wide = barW >= 1080;
   const withHotkey = barW >= 760;
@@ -585,10 +585,15 @@ export default function Recorder() {
   const restoreText = barW >= 480;
   const presetValue = settings.sizePresets.findIndex(([w, h]) => w === hole.w && h === hole.h);
   const captureSize = fullMonitor ?? hole;
+  // 녹음(PC 소리)은 MP4 저장이 켜져 있을 때만 된다
+  const soundOn = settings.recDirectSave && settings.recDirectSaveAudio;
+  const withSound = (on: boolean): Settings =>
+    on ? { ...settings, recDirectSave: true, recDirectSaveAudio: true } : { ...settings, recDirectSaveAudio: false };
   // 틀에서 떼어 둔 툴바는 끌어도 창 전체가 움직이므로 끌기를 막는다
   const drag = mode === "normal" ? "" : undefined;
 
-  // 영역·크기·FPS 목록. 넓으면 글자가 보이는 칸, 좁으면 아이콘 버튼 위에 투명하게 겹친다.
+  // 영역·FPS 목록. 넓으면 글자가 보이는 칸, 좁으면 아이콘 버튼 위에 투명하게 겹친다.
+  // 영역 목록에는 녹화할 곳과 해상도(직접 입력, 저장해 둔 크기)가 함께 있다.
   const areaSelect = (
     <select
       value=""
@@ -600,10 +605,20 @@ export default function Recorder() {
         else if (v === "half") fitMonitor(2);
         else if (v === "quarter") fitMonitor(4);
         else if (v === "default") resetFrame();
+        else if (v === "custom") setSizeDraft({ w: String(captureSize.w), h: String(captureSize.h) });
+        else if (v === "add") {
+          if (!settings.sizePresets.some(([w, h]) => w === captureSize.w && h === captureSize.h))
+            saveSettings({ ...settings, sizePresets: [...settings.sizePresets, [captureSize.w, captureSize.h]] });
+        } else if (v === "remove" && presetValue >= 0) {
+          saveSettings({ ...settings, sizePresets: settings.sizePresets.filter((_, i) => i !== presetValue) });
+        } else if (v.startsWith("size:")) {
+          const [w, h] = settings.sizePresets[Number(v.slice(5))];
+          setHoleSize(w, h);
+        }
       }}
     >
       <option value="" hidden>
-        {fullMonitor ? "전체 화면" : "영역"}
+        {fullMonitor ? "전체" : "영역"}
       </option>
       <option value="default">기본 영역 (화면 가운데)</option>
       <option value="window">창 찾아 맞추기 (Ctrl+Shift+F)</option>
@@ -611,36 +626,16 @@ export default function Recorder() {
       <option value="full">모니터 전체 화면</option>
       <option value="half">모니터 절반</option>
       <option value="quarter">모니터 1/4</option>
-    </select>
-  );
-  const sizeSelect = (
-    <select
-      value=""
-      onChange={(e) => {
-        const v = e.target.value;
-        if (v === "custom") setSizeDraft({ w: String(captureSize.w), h: String(captureSize.h) });
-        else if (v === "add") {
-          if (!settings.sizePresets.some(([w, h]) => w === captureSize.w && h === captureSize.h))
-            saveSettings({ ...settings, sizePresets: [...settings.sizePresets, [captureSize.w, captureSize.h]] });
-        } else if (v === "remove" && presetValue >= 0) {
-          saveSettings({ ...settings, sizePresets: settings.sizePresets.filter((_, i) => i !== presetValue) });
-        } else if (v !== "") {
-          const [w, h] = settings.sizePresets[Number(v)];
-          setHoleSize(w, h);
-        }
-      }}
-    >
-      <option value="">
-        {captureSize.w} × {captureSize.h}
-      </option>
-      {settings.sizePresets.map(([w, h], i) => (
-        <option key={i} value={i}>
-          {w} × {h}
-        </option>
-      ))}
-      <option value="custom">직접 입력…</option>
-      <option value="add">현재 크기를 목록에 추가</option>
-      {presetValue >= 0 && <option value="remove">현재 크기를 목록에서 삭제</option>}
+      <optgroup label={`해상도 (지금 ${captureSize.w} × ${captureSize.h})`}>
+        <option value="custom">해상도 직접 입력…</option>
+        {settings.sizePresets.map(([w, h], i) => (
+          <option key={i} value={`size:${i}`}>
+            {w} × {h}
+          </option>
+        ))}
+        <option value="add">현재 크기를 목록에 추가</option>
+        {presetValue >= 0 && <option value="remove">현재 크기를 목록에서 삭제</option>}
+      </optgroup>
     </select>
   );
   const fpsSelect = (
@@ -659,14 +654,14 @@ export default function Recorder() {
       <option value="custom">{FPS_LIST.includes(settings.fps) ? "직접 입력" : `${settings.fps} FPS`}</option>
     </select>
   );
-  const pick = (icon: React.ReactNode, title: string, iconOnly: boolean, select: React.ReactNode, showIcon = true) =>
+  const pick = (icon: React.ReactNode, title: string, iconOnly: boolean, select: React.ReactNode, showIcon = true, cls = "") =>
     iconOnly ? (
       <label className="rec-btn icon menu" title={title}>
         {icon}
         {select}
       </label>
     ) : (
-      <label className="rec-dd" title={title}>
+      <label className={`rec-dd ${cls}`} title={title}>
         {showIcon && icon}
         {select}
         <IconChevronDown size={14} className="chev" />
@@ -740,7 +735,7 @@ export default function Recorder() {
         )}
         {/* 가운데 칸: 자리가 모자라면 여기만 잘려서 오른쪽 닫기 버튼은 늘 보인다 */}
         <div className="rec-mid" data-tauri-drag-region={drag}>
-          {/* 쉬는 중에 아주 좁으면 시간(0:00)은 빼고 영역·크기·FPS 버튼을 남긴다 */}
+          {/* 쉬는 중에 아주 좁으면 시간(0:00)은 빼고 영역·FPS 버튼을 남긴다 */}
           {(recording || small) && (
             <span className="rec-timer" data-tauri-drag-region={drag}>
               {formatMs(status?.elapsedMs ?? 0)}
@@ -754,8 +749,15 @@ export default function Recorder() {
           ) : (
             <>
               {small && <span className="rec-sep" />}
-              {pick(<IconMarquee2 size={16} />, `녹화할 곳 정하기${fullMonitor ? " (지금: 전체 화면)" : ""}`, !withHotkey, areaSelect)}
-              {sizeDraft ? (
+              {pick(
+                <IconMarquee2 size={16} />,
+                `녹화할 곳·해상도 정하기 (지금: ${fullMonitor ? "전체 화면, " : ""}${captureSize.w} × ${captureSize.h})`,
+                !withHotkey,
+                areaSelect,
+                true,
+                "narrow",
+              )}
+              {sizeDraft && (
                 <span className="rec-size" title="녹화 영역 크기 (Enter로 적용, Esc로 취소)">
                   <input
                     autoFocus
@@ -779,8 +781,6 @@ export default function Recorder() {
                     <IconCheck size={14} />
                   </button>
                 </span>
-              ) : (
-                pick(<IconDimensions size={16} />, `녹화 영역 크기 ${captureSize.w} × ${captureSize.h}`, !small, sizeSelect, false)
               )}
               {fpsDraft !== null ? (
                 <span className="rec-size" title="FPS (1~100), Enter로 적용, Esc로 취소">
@@ -818,12 +818,19 @@ export default function Recorder() {
                   </label>
                   <label className="rec-switch" title="녹화하면서 MP4 파일로 바로 저장">
                     <IconMovie size={16} />
-                    MP4 바로 저장
+                    MP4 저장
                     <input
                       type="checkbox"
                       checked={settings.recDirectSave}
                       onChange={(e) => saveSettings({ ...settings, recDirectSave: e.target.checked })}
                     />
+                    <i />
+                  </label>
+                  {/* 소리는 바로 저장하는 MP4에만 들어가므로, 녹음을 켜면 MP4 저장도 같이 켠다 */}
+                  <label className="rec-switch" title="PC에서 나는 소리도 MP4에 넣기 (MP4 저장이 함께 켜집니다)">
+                    <IconVolume size={16} />
+                    녹음
+                    <input type="checkbox" checked={soundOn} onChange={(e) => saveSettings(withSound(e.target.checked))} />
                     <i />
                   </label>
                 </>
@@ -875,6 +882,7 @@ export default function Recorder() {
               else if (v === "default") resetFrame();
               else if (v === "settings") openSettings();
               else if (v === "mp4") saveSettings({ ...settings, recDirectSave: !settings.recDirectSave });
+              else if (v === "sound") saveSettings(withSound(!soundOn));
               else if (v === "cursor") saveSettings({ ...settings, captureCursor: !settings.captureCursor });
               else if (v) openMenu(v);
             }}
@@ -888,7 +896,8 @@ export default function Recorder() {
             <option value="newBlank">빈 이미지/영상 만들기…</option>
             <option value="collage">콜라주…</option>
             <option value="manage">파일 관리…</option>
-            <option value="mp4">MP4 바로 저장: {settings.recDirectSave ? "켜짐 → 끄기" : "꺼짐 → 켜기"}</option>
+            <option value="mp4">MP4 저장: {settings.recDirectSave ? "켜짐 → 끄기" : "꺼짐 → 켜기"}</option>
+            <option value="sound">녹음 (PC 소리): {soundOn ? "켜짐 → 끄기" : "꺼짐 → 켜기"}</option>
             <option value="cursor">커서 녹화: {settings.captureCursor ? "켜짐 → 끄기" : "꺼짐 → 켜기"}</option>
             <option value="settings">설정…</option>
           </select>

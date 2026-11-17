@@ -248,6 +248,11 @@ body,
   max-width: 110px;
 }
 
+/* 영역 목록: 목록에서 가장 긴 글자만큼 넓어지지 않게, 두 글자("영역"·"전체")만 보인다 */
+.rec-dd.narrow select {
+  width: 40px;
+}
+
 .rec-dd select:focus {
   outline: none;
 }
