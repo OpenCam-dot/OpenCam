@@ -14,13 +14,16 @@ export interface FrameCtx {
 }
 export const FrameContext = createContext<FrameCtx>({ current: 0, total: 0, sel: [] });
 
-/** 도구 패널에 아직 적용하지 않은 변경이 있는지 편집 창에 알린다 (다른 도구로 바꿀 때 물어보려고) */
-export const DirtyReport = createContext<(dirty: boolean) => void>(() => {});
+/** 도구 패널에 아직 적용하지 않은 변경이 있는지 편집 창에 알린다 (다른 도구로 바꿀 때 물어보려고).
+ *  알리는 쪽마다 따로 센다. 하나로 두면 "버릴까요?" 확인 창처럼 나중에 뜬 다른 창이 "변경 없음"을 알릴 때
+ *  도구의 "변경 있음"을 지워 버려, 취소한 뒤 다음번에는 묻지 않고 작업이 날아갔다. */
+export const DirtyReport = createContext<(who: object, dirty: boolean) => void>(() => {});
 
 export function useReportDirty(dirty: boolean) {
   const report = useContext(DirtyReport);
-  useEffect(() => report(dirty), [dirty, report]);
-  useEffect(() => () => report(false), [report]);
+  const me = useRef({});
+  useEffect(() => report(me.current, dirty), [dirty, report]);
+  useEffect(() => () => report(me.current, false), [report]);
 }
 
 /** 썸네일 줄의 적용 범위 띠와 이어 주는 것 (편집 창이 준다) */

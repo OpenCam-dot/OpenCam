@@ -449,8 +449,9 @@ fn mix_into(px: &mut [u8], other: impl Fn(usize) -> u8, t: f32) {
 /// 전환 효과. tm: 이 프레임의 가운데 시각, total: 구간 전체 시간, ms: 효과 길이, first: 구간 첫 프레임 픽셀
 pub fn apply_transition(px: &mut [u8], kind: TransitionKind, tm: f32, total: f32, ms: f32, first: &[u8]) {
     let ms = ms.max(1.0);
-    let head = 1.0 - tm / ms; // 앞부분 효과 세기 (처음 1 → 0)
-    let tail = 1.0 - (total - tm) / ms; // 뒷부분 효과 세기 (0 → 끝 1)
+    // 효과 구간 밖에서는 0 (음수를 그대로 두면 플래시처럼 제곱할 때 다시 양수가 된다)
+    let head = (1.0 - tm / ms).max(0.0); // 앞부분 효과 세기 (처음 1 → 0)
+    let tail = (1.0 - (total - tm) / ms).max(0.0); // 뒷부분 효과 세기 (0 → 끝 1)
     match kind {
         TransitionKind::FadeInWhite => mix_into(px, |_| 255, head),
         TransitionKind::FadeInBlack => mix_into(px, |_| 0, head),
@@ -847,6 +848,20 @@ mod tests {
         let mut p = img(1, 1, [0, 0, 0, 255]);
         apply_transition(&mut p, TransitionKind::FadeInWhite, 600.0, 1000.0, 500.0, &first);
         assert_eq!(p[0], 0);
+    }
+
+    #[test]
+    fn flash_stays_off_after_its_length() {
+        let first = img(1, 1, [0, 0, 0, 255]);
+        // 효과 길이(500ms)가 지난 뒤에는 어느 시각이든 원래 색 그대로
+        for tm in [500.0, 800.0, 1000.0, 1500.0, 3000.0] {
+            let mut p = img(1, 1, [0, 0, 0, 255]);
+            apply_transition(&mut p, TransitionKind::Flash, tm, 4000.0, 500.0, &first);
+            assert_eq!(p[0], 0, "tm={tm}");
+        }
+        let mut p = img(1, 1, [0, 0, 0, 255]);
+        apply_transition(&mut p, TransitionKind::Flash, 0.0, 4000.0, 500.0, &first);
+        assert_eq!(p[0], 255);
     }
 
     #[test]

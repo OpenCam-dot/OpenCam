@@ -142,10 +142,11 @@ export default function Editor() {
   const [stage, setStage] = useState({ w: 800, h: 500 });
   /** 오른쪽 패널 자리. 도구 화면이 설정 패널을 여기로 옮겨 그린다. */
   const [sideEl, setSideEl] = useState<HTMLElement | null>(null);
-  /** 열린 도구 패널에 아직 적용하지 않은 변경이 있나 (패널이 알려 준다) */
-  const toolDirty = useRef(false);
-  const reportDirty = useCallback((d: boolean) => {
-    toolDirty.current = d;
+  /** 열린 도구 패널 가운데 아직 적용하지 않은 변경이 있는 것들 (패널이 알려 준다) */
+  const toolDirty = useRef(new Set<object>());
+  const reportDirty = useCallback((who: object, d: boolean) => {
+    if (d) toolDirty.current.add(who);
+    else toolDirty.current.delete(who);
   }, []);
 
   const frames = view.frames;
@@ -584,9 +585,9 @@ export default function Editor() {
 
   /** 열린 도구에 적용하지 않은 변경이 있으면 버려도 되는지 묻는다 */
   const leaveTool = async () => {
-    if (!toolDirty.current) return true;
+    if (toolDirty.current.size === 0) return true;
     if (!(await confirmAsk("적용하지 않은 변경이 있습니다. 버리고 다른 도구로 바꿀까요?", "버리고 바꾸기"))) return false;
-    toolDirty.current = false;
+    toolDirty.current.clear();
     return true;
   };
 

@@ -1119,16 +1119,51 @@ pub(crate) fn spawn_stderr_tail(
     })
 }
 
+/// 동영상 저장의 고정 FPS를 분수(분자, 분모)로 정한다. 프레임 시간이 모두 한 칸의 정수배가 되게
+/// 프레임 시간들의 최대공약수를 쓰고, 60FPS를 넘으면 60FPS로 둔다(1FPS 아래로는 내리지 않는다).
+/// 예전에는 1000을 가장 짧은 시간으로 나눈 몫(정수)을 써서, 600ms 프레임이 1FPS 한 칸(1초)이 되어 영상이 느려졌다.
+fn video_rate(delays: impl Iterator<Item = u32>) -> (u64, u64) {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let mut g = 0u64;
+    let mut min = u64::MAX;
+    for d in delays {
+        let d = d.max(10) as u64;
+        g = gcd(g, d);
+        min = min.min(d);
+    }
+    if g == 0 {
+        return (10, 1); // 프레임이 없을 때 (예전 기본값 100ms와 같음)
+    }
+    // 한 칸 길이(ms): 모두 나누어떨어지는 길이가 너무 짧으면 가장 짧은 프레임 길이
+    let step = if g >= 17 { g } else { min };
+    if step < 17 {
+        (60, 1)
+    } else if step > 1000 {
+        (1, 1)
+    } else {
+        let k = gcd(1000, step);
+        (1000 / k, step / k)
+    }
+}
+
+/// 누적 시간 t(ms)까지 들어가야 하는 출력 프레임 수. 반올림해서 전체 시간이 어긋나지 않게 한다.
+fn output_frames_until(t: u64, fps_num: u64, fps_den: u64, written: u64) -> u64 {
+    let n = t as u128 * fps_num as u128;
+    let d = fps_den as u128 * 1000;
+    (((n * 2 + d) / (d * 2)) as u64).max(written)
+}
+
 fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Settings, progress: Progress) -> Result<()> {
     let mut cmd = ffmpeg()
         .ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. ffmpeg를 설치하거나 프로그램 폴더에 넣어 주세요."))?;
     let (w, h) = (frames[0].width, frames[0].height);
-    // 프레임마다 시간이 달라서, 가장 짧은 프레임 기준의 고정 FPS로 맞춰 같은 화면을 반복해서 넣는다
-    let min_delay = frames.iter().map(|f| f.delay_ms.max(10)).min().unwrap_or(100);
-    let fps = (1000 / min_delay).clamp(1, 60);
+    // 프레임마다 시간이 달라서, 고정 FPS로 맞춰 같은 화면을 반복해서 넣는다
+    let (fps_num, fps_den) = video_rate(frames.iter().map(|f| f.delay_ms));
     let q = quality.min(100) as f32;
     cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba"])
-        .args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
+        .args(["-s", &format!("{w}x{h}"), "-r", &format!("{fps_num}/{fps_den}"), "-i", "-"])
         // yuv420p는 가로·세로가 짝수여야 한다
         .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
     match format {
@@ -1173,7 +1208,15 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
         let mut t = 0u64;
         'outer: for (i, f) in frames.iter().enumerate() {
             t += f.delay_ms as u64;
-            let until = (t * fps as u64 / 1000).max(written + 1);
+            let mut until = output_frames_until(t, fps_num, fps_den, written);
+            if i + 1 == frames.len() && until == 0 {
+                until = 1; // 아주 짧은 영상이라도 한 장은 넣는다
+            }
+            if until == written {
+                // 출력 한 칸보다 짧은 프레임: 건너뛰어도 전체 시간은 그대로다
+                progress((i + 1) as f32 / frames.len() as f32 * 0.95, "동영상 인코딩 중");
+                continue;
+            }
             let mut px = f.rgba();
             if let Some(c) = matte {
                 composite_over(&mut px, c);
@@ -1265,7 +1308,24 @@ impl Mp4Stream {
         if !status.success() {
             bail!("MP4 바로 저장 실패 (ffmpeg 종료 코드 {:?})", status.code());
         }
-        Ok(self.path)
+        Ok(self.path.clone())
+    }
+}
+
+impl Drop for Mp4Stream {
+    /// finish 없이 버려졌으면(녹화 시작 실패, 화면이 한 장도 없음) ffmpeg를 끄고 만들던 파일을 지운다.
+    /// 그냥 두면 빈 MP4가 저장 폴더에 남았다.
+    fn drop(&mut self) {
+        if self.tx.is_none() {
+            return; // finish가 이미 마무리했다
+        }
+        drop(self.tx.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1468,6 +1528,60 @@ pub fn probe_audio(path: &Path) -> (bool, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 프레임 시간들을 동영상으로 옮겼을 때의 전체 길이(ms)
+    fn video_length_ms(delays: &[u32]) -> f64 {
+        let (num, den) = video_rate(delays.iter().copied());
+        let mut written = 0;
+        let mut t = 0u64;
+        for (i, d) in delays.iter().enumerate() {
+            t += *d as u64;
+            let mut until = output_frames_until(t, num, den, written);
+            if i + 1 == delays.len() && until == 0 {
+                until = 1;
+            }
+            written = until;
+        }
+        written as f64 * den as f64 * 1000.0 / num as f64
+    }
+
+    #[test]
+    fn video_keeps_the_original_length() {
+        // 600ms 슬라이드 10장 = 6초 (예전에는 1FPS가 되어 10초였다)
+        assert_eq!(video_rate([600u32; 10].into_iter()), (5, 3));
+        assert!((video_length_ms(&[600; 10]) - 6000.0).abs() < 1.0);
+        // 100FPS 녹화(10ms) 300장 = 3초 (예전에는 60FPS로 한 장씩 넣어 5초였다)
+        assert_eq!(video_rate([10u32; 300].into_iter()), (60, 1));
+        assert!((video_length_ms(&[10; 300]) - 3000.0).abs() < 17.0);
+        // 서로 다른 시간이 섞여도 전체 길이는 한 칸 안에서 맞는다
+        let mixed = [40, 50, 40, 50, 600, 33, 33, 34, 1500];
+        let total: u32 = mixed.iter().sum();
+        assert!((video_length_ms(&mixed) - total as f64).abs() < 17.0);
+        // 아주 긴 프레임만 있으면 1FPS
+        assert_eq!(video_rate([3000u32, 5000].into_iter()), (1, 1));
+        assert!((video_length_ms(&[3000, 5000]) - 8000.0).abs() < 1.0);
+        // 아주 짧은 한 장도 한 칸은 들어간다
+        assert!(video_length_ms(&[10]) > 0.0);
+    }
+
+    #[test]
+    fn abandoned_direct_mp4_leaves_no_file() {
+        if find_ffmpeg().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("opencam_mp4_drop_{}", std::process::id()));
+        let path = dir.join("v.mp4");
+        let stream = Mp4Stream::start(&path, 16, 16, 10, 80, true).unwrap();
+        stream.push(std::sync::Arc::new(vec![0; 16 * 16 * 4]), 3);
+        drop(stream);
+        assert!(!path.exists(), "finish 없이 버린 MP4는 지운다");
+        // finish한 것은 그대로 남는다
+        let stream = Mp4Stream::start(&path, 16, 16, 10, 80, true).unwrap();
+        stream.push(std::sync::Arc::new(vec![0; 16 * 16 * 4]), 3);
+        let saved = stream.finish().unwrap();
+        assert!(saved.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sound_is_encoded_while_recording_and_joined_to_the_video_in_sync() {

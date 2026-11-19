@@ -131,11 +131,21 @@ impl AudioCapture {
 
 impl Drop for AudioCapture {
     fn drop(&mut self) {
-        // finish 없이 버려졌으면 (녹화를 시작하지 못함) 조용히 정리한다
+        // finish 없이 버려졌으면 (녹화를 시작하지 못함) 조용히 정리한다.
+        // 소리 장치가 응답하지 않아 버려진 경우에는 스레드가 언제 끝날지 모른다. 여기서 기다리면
+        // 녹화를 시작하던 쪽(녹화 잠금을 쥐고 있음)까지 멈춰 앱 전체가 얼어붙으므로, 기다림과
+        // 파일 지우기는 다른 스레드에 맡긴다.
         if let Some(t) = self.thread.take() {
             self.shared.stop.store(true, Ordering::SeqCst);
-            let _ = t.join();
-            let _ = std::fs::remove_file(&self.path);
+            let path = self.path.clone();
+            let cleanup = move || {
+                let _ = t.join();
+                let _ = std::fs::remove_file(&path);
+            };
+            if let Err(e) = std::thread::Builder::new().name("opencam-audio-cleanup".into()).spawn(cleanup) {
+                // 스레드를 못 만들면 기다리지 않고 놓아 둔다 (파일은 남을 수 있다)
+                eprintln!("소리 정리 스레드를 만들 수 없음: {e}");
+            }
         }
     }
 }
@@ -715,6 +725,28 @@ mod tests {
             return;
         };
         drop(cap);
+        // 정리는 다른 스레드가 하므로 잠깐 기다린다
+        let t = Instant::now();
+        while path.exists() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!path.exists());
+    }
+
+    /// 소리 장치가 응답하지 않아 버려도, 버리는 쪽은 기다리지 않는다 (녹화 시작이 멈추지 않는다)
+    #[test]
+    fn dropping_a_stuck_capture_does_not_wait_for_it() {
+        let shared =
+            Arc::new(Shared { stop: AtomicBool::new(false), marks: Mutex::new(VecDeque::new()), total: Mutex::new(None) });
+        // 응답 없는 장치처럼 3초 동안 끝나지 않는 스레드
+        let thread = std::thread::spawn(|| -> Result<Captured> {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok((0, None))
+        });
+        let path = std::env::temp_dir().join(format!("opencam_audio_{}_stuck.tmp", std::process::id()));
+        let cap = AudioCapture { shared, thread: Some(thread), path };
+        let t = Instant::now();
+        drop(cap);
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
     }
 }
