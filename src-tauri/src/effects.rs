@@ -244,27 +244,37 @@ pub fn apply_filter(px: &mut [u8], w: u32, h: u32, f: &Filter) {
             let r = region.unwrap_or(Region { x: 0, y: 0, w: wi, h: hi, ellipse: false });
             let mut out = px.to_vec();
             // 영역 왼쪽 위에 맞춰 칸을 나눈다
+            // 칸은 영역 안에서만 평균을 낸다 (오른쪽·아래 끝 칸에 영역 밖의 색이 섞이지 않게)
+            let (rx1, ry1) = ((r.x + r.w).min(wi), (r.y + r.h).min(hi));
             let mut by = r.y.max(0);
-            while by < (r.y + r.h).min(hi) {
+            while by < ry1 {
                 let mut bx = r.x.max(0);
-                while bx < (r.x + r.w).min(wi) {
-                    let (x1, y1) = ((bx + size).min(wi), (by + size).min(hi));
-                    let mut sum = [0u32; 4];
+                while bx < rx1 {
+                    let (x1, y1) = ((bx + size).min(rx1), (by + size).min(ry1));
+                    // 색은 불투명도만큼 무게를 둬서 평균한다 (투명한 픽셀에 남은 색이 섞이지 않게)
+                    let mut sum = [0u64; 4];
                     for y in by..y1 {
                         for x in bx..x1 {
                             let i = ((y * wi + x) * 4) as usize;
-                            for k in 0..4 {
-                                sum[k] += px[i + k] as u32;
+                            let a = px[i + 3] as u64;
+                            for k in 0..3 {
+                                sum[k] += px[i + k] as u64 * a;
                             }
+                            sum[3] += a;
                         }
                     }
-                    let n = ((x1 - bx) * (y1 - by)) as u32;
+                    let n = ((x1 - bx) * (y1 - by)) as u64;
+                    let mut avg = [0u8; 4];
+                    if sum[3] > 0 {
+                        for k in 0..3 {
+                            avg[k] = (sum[k] / sum[3]) as u8;
+                        }
+                        avg[3] = (sum[3] / n) as u8;
+                    }
                     for y in by..y1 {
                         for x in bx..x1 {
                             let i = ((y * wi + x) * 4) as usize;
-                            for k in 0..4 {
-                                out[i + k] = (sum[k] / n) as u8;
-                            }
+                            out[i..i + 4].copy_from_slice(&avg);
                         }
                     }
                     bx += size;
@@ -383,12 +393,34 @@ fn copy_in_region(px: &mut [u8], src: &[u8], w: i32, h: i32, region: Option<Regi
 }
 
 /// 상자 흐리기를 passes번 (3번이면 가우시안과 거의 같다)
+///
+/// 투명한 곳이 있으면 색에 불투명도를 곱해 놓고 흐린 뒤 되돌린다. 그냥 섞으면 투명한 픽셀에 남아 있는 색
+/// (크로마키로 지운 초록 등)이 가장자리로 번져 테두리가 생긴다.
 pub fn box_blur(px: &mut [u8], w: u32, h: u32, r: u32, passes: u32) {
     let (w, h, r) = (w as usize, h as usize, r as usize);
+    let has_alpha = px.chunks_exact(4).any(|p| p[3] != 255);
+    if has_alpha {
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
     let mut tmp = vec![0u8; px.len()];
     for _ in 0..passes {
         blur_line(px, &mut tmp, w, h, r, true);
         blur_line(&tmp, px, w, h, r, false);
+    }
+    if has_alpha {
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if a > 0 && a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
     }
 }
 
@@ -863,6 +895,30 @@ mod tests {
         let mut p = img(1, 1, [0, 0, 0, 255]);
         apply_transition(&mut p, TransitionKind::FadeInWhite, 600.0, 1000.0, 500.0, &first);
         assert_eq!(p[0], 0);
+    }
+
+    #[test]
+    fn mosaic_stays_inside_its_region() {
+        // 왼쪽 3칸은 검정, 오른쪽 1칸은 흰색. 왼쪽 3칸만 모자이크(칸 크기 2)하면 흰색이 섞이면 안 된다
+        let mut p: Vec<u8> = [[0u8, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255], [255, 255, 255, 255]].concat();
+        let region = Region { x: 0, y: 0, w: 3, h: 1, ellipse: false };
+        apply_filter(&mut p, 4, 1, &Filter::Mosaic { size: 2, region: Some(region) });
+        assert_eq!(&p[8..11], &[0, 0, 0], "영역 끝 칸에 영역 밖의 색이 섞였다");
+        assert_eq!(&p[12..15], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn blur_and_mosaic_ignore_the_color_of_transparent_pixels() {
+        // 투명한 초록(크로마키로 지운 곳) 옆의 불투명한 빨강: 섞어도 초록이 번지지 않는다
+        let row: Vec<u8> = [[0u8, 255, 0, 0], [0, 255, 0, 0], [200, 0, 0, 255], [200, 0, 0, 255]].concat();
+        let mut blurred = row.clone();
+        box_blur(&mut blurred, 4, 1, 1, 1);
+        for p in blurred.chunks_exact(4).filter(|p| p[3] > 0) {
+            assert!(p[1] <= 2 && p[0] >= 190, "초록이 번졌다: {p:?}");
+        }
+        let mut mosaic = row.clone();
+        apply_filter(&mut mosaic, 4, 1, &Filter::Mosaic { size: 4, region: None });
+        assert_eq!(&mosaic[..4], &[200, 0, 0, 127]);
     }
 
     #[test]

@@ -425,6 +425,13 @@ impl Project {
             return;
         }
         self.checkpoint();
+        self.map_timed_now(idx, tag, f);
+    }
+
+    /// `map_timed`에서 되돌리기 지점 만들기를 뺀 것 (한 번의 편집 안에서 여러 번 부를 때).
+    /// 픽셀이 바뀌지 않은 프레임은 그대로 둔다: 이름표도 붙이지 않고 다시 압축하지도 않는다.
+    /// (0.5초 페이드를 넣으면 효과가 닿지 않는 나머지 프레임까지 이름표가 붙고 다시 압축됐다.)
+    fn map_timed_now(&mut self, idx: &[usize], tag: u8, f: impl Fn(&mut [u8], u32, u32, f32, f32) + Sync) {
         let mut mids = Vec::with_capacity(idx.len());
         let mut t = 0.0f32;
         for &i in idx {
@@ -437,12 +444,11 @@ impl Project {
             .par_iter()
             .zip(mids.par_iter())
             .map(|(&i, &tm)| {
-                self.frames[i]
-                    .map_pixels(|w, h, mut px| {
-                        f(&mut px, w, h, tm, total);
-                        (w, h, px)
-                    })
-                    .tagged(tag)
+                let fr = &self.frames[i];
+                let before = fr.rgba();
+                let mut px = before.clone();
+                f(&mut px, fr.width, fr.height, tm, total);
+                if px == before { fr.clone() } else { fr.with_pixels(fr.width, fr.height, &px).tagged(tag) }
             })
             .collect();
         for (&i, fr) in idx.iter().zip(changed) {
@@ -458,24 +464,37 @@ impl Project {
             return;
         }
         let idx = self.sel_or_all(sel);
-        self.map_timed(&idx, tag::FILTER, |px, w, h, _, _| {
-            for f in filters {
-                effects::apply_filter(px, w, h, f);
+        if idx.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        // 목록의 순서대로 적용한다. 잔상은 앞 프레임의 결과가 필요해 프레임을 차례로 돌아야 하므로,
+        // 잔상을 만나면 그 앞까지의 필터를 먼저 적용하고 잔상을 넣은 뒤 나머지를 이어 간다.
+        // (예전에는 잔상을 늘 맨 마지막에 넣어, 크로마키·지우개보다 앞에 둬도 뒤에 적용됐다.)
+        let mut rest = filters;
+        while !rest.is_empty() {
+            let cut = rest.iter().position(|f| matches!(f, Filter::Afterimage { .. })).unwrap_or(rest.len());
+            let (plain, tail) = rest.split_at(cut);
+            if !plain.is_empty() {
+                self.map_timed_now(&idx, tag::FILTER, |px, w, h, _, _| {
+                    for f in plain {
+                        effects::apply_filter(px, w, h, f);
+                    }
+                });
             }
-        });
-        // 잔상 효과는 앞 프레임 결과가 필요해서 차례대로 (위에서 이미 되돌리기 지점을 만들었다)
-        for f in filters {
-            if let Filter::Afterimage { strength } = *f {
+            rest = tail;
+            if let Some((Filter::Afterimage { strength }, after)) = rest.split_first() {
                 let mut prev: Option<Vec<u8>> = None;
                 for &i in &idx {
                     let fr = &self.frames[i];
                     let mut px = fr.rgba();
                     if let Some(p) = &prev {
-                        crate::filters::afterimage(&mut px, p, strength);
+                        crate::filters::afterimage(&mut px, p, *strength);
+                        self.frames[i] = fr.with_pixels(fr.width, fr.height, &px).tagged(tag::FILTER);
                     }
-                    self.frames[i] = fr.with_pixels(fr.width, fr.height, &px);
                     prev = Some(px);
                 }
+                rest = after;
             }
         }
     }
@@ -888,6 +907,37 @@ mod tests {
         p.load(vec![solid(4000, 1, 0, 100)]);
         assert!(p.upscale(4, usize::MAX).is_err());
         assert_eq!(p.frames[0].width, 4000);
+    }
+
+    #[test]
+    fn short_transition_leaves_the_other_frames_alone() {
+        let mut p = Project::default();
+        // 100ms 프레임 10장(1초)에 0.2초 페이드 인: 앞의 두 장만 바뀐다
+        p.load((0..10).map(|_| solid(4, 4, 100, 100)).collect());
+        let keys: Vec<usize> = p.frames.iter().map(|f| f.packed_key()).collect();
+        p.transition(&[], TransitionKind::FadeInBlack, 200);
+        let tagged: Vec<bool> = p.frames.iter().map(|f| f.tags & tag::TRANSITION != 0).collect();
+        assert_eq!(tagged, [true, true, false, false, false, false, false, false, false, false]);
+        // 안 바뀐 프레임은 다시 압축하지 않고 같은 버퍼를 그대로 쓴다
+        assert!(p.frames[2..].iter().zip(&keys[2..]).all(|(f, k)| f.packed_key() == *k));
+    }
+
+    #[test]
+    fn afterimage_runs_in_the_listed_order() {
+        // 감마 → 잔상과 잔상 → 감마는 결과가 다르다 (예전에는 잔상을 늘 맨 뒤에 넣어 둘이 같았다)
+        let make = || {
+            let mut p = Project::default();
+            p.load(vec![solid(2, 2, 0, 100), solid(2, 2, 200, 100)]);
+            p
+        };
+        let after = Filter::Afterimage { strength: 50.0 };
+        let (mut a, mut b) = (make(), make());
+        let gamma = Filter::Gamma { value: 2.5 };
+        a.apply_filters(&[], &[gamma.clone(), after.clone()]);
+        b.apply_filters(&[], &[after, gamma]);
+        assert_ne!(a.frames[1].rgba(), b.frames[1].rgba());
+        // 바뀐 프레임에는 이름표가 붙는다 (검은 첫 장은 감마로도 잔상으로도 바뀌지 않아 그대로다)
+        assert!(a.frames[1].tags & tag::FILTER != 0 && a.frames[0].tags == 0);
     }
 
     #[test]
