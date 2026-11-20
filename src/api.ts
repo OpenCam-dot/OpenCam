@@ -410,10 +410,16 @@ export const api = {
   defaultSavePath: (ext: string) => invoke<string>("default_save_path", { ext }),
   pickSavePath: (current: string, ext: string) => invoke<string | null>("pick_save_path", { current, ext }),
   pickFolder: (current: string) => invoke<string | null>("pick_folder", { current }),
-  exportConflicts: (opts: ExportOptions, path: string) => invoke<string[]>("export_conflicts", { opts, path }),
-  exportProject: (opts: ExportOptions, path: string) => invoke<ExportResult>("export_project", { opts, path }),
-  exportProjectFit: (opts: ExportOptions, fit: FitOptions, path: string) => invoke<ExportResult>("export_project_fit", { opts, fit, path }),
-  estimateSize: (opts: ExportOptions) => invoke<number>("estimate_size", { opts }),
+  // fmt: 이번 저장에만 쓰는 설정 값(저장 창의 형식별 옵션). 설정 파일은 바꾸지 않는다.
+  exportConflicts: (opts: ExportOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<string[]>("export_conflicts", { opts, path, fmt }),
+  exportProject: (opts: ExportOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<ExportResult>("export_project", { opts, path, fmt }),
+  exportProjectFit: (opts: ExportOptions, fit: FitOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<ExportResult>("export_project_fit", { opts, fit, path, fmt }),
+  estimateSize: (opts: ExportOptions, fmt?: Partial<Settings>) => invoke<number>("estimate_size", { opts, fmt }),
+  /** 진행 중인 저장을 멈춘다 */
+  cancelExport: () => invoke<void>("cancel_export"),
   hasFfmpeg: () => invoke<boolean>("has_ffmpeg"),
   revealFile: (path: string) => invoke<void>("reveal_file", { path }),
   deleteFile: (path: string) => invoke<void>("delete_file", { path }),

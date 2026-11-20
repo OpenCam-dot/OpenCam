@@ -677,9 +677,11 @@ fn set_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) 
     if let Ok(r) = recorder_window(&app) {
         let _ = r.set_always_on_top(on_top);
     }
-    register_hotkeys(&app)?;
+    // 단축키 등록이 실패해도 설정은 이미 바뀌었으므로 다른 창에 먼저 알린다.
+    // 알리지 않으면 다른 창이 옛 설정을 들고 있다가 통째로 저장해 방금 바꾼 값을 되돌렸다.
+    let hotkeys = register_hotkeys(&app);
     let _ = app.emit("settings-changed", ());
-    Ok(())
+    hotkeys
 }
 
 fn register_hotkeys(app: &AppHandle) -> CmdResult<()> {
@@ -977,17 +979,51 @@ struct ExportResult {
 }
 
 /// 저장에 쓸 프레임 목록과 설정을 복사해 온다 (픽셀은 함께 쓰므로 복사가 싸다). 잠금은 바로 푼다.
-fn snapshot(app: &AppHandle) -> (Vec<frame::Frame>, Settings) {
+/// 저장 창에서 이번 저장에만 쓰는 설정 값들 (형식별 옵션). 설정 파일은 바꾸지 않는다.
+type SettingOverrides = Option<serde_json::Map<String, serde_json::Value>>;
+
+/// 저장에 쓸 프레임과 설정, 그리고 그때의 편집 번호(저장하는 동안 편집했는지 알아보려고)
+fn snapshot(app: &AppHandle, fmt: SettingOverrides) -> (Vec<frame::Frame>, Settings, u64) {
     let state = app.state::<AppState>();
-    let frames = state.project.lock().frames.clone();
+    let (frames, revision) = {
+        let p = state.project.lock();
+        (p.frames.clone(), p.revision)
+    };
     let s = state.settings.lock().clone();
-    (frames, s)
+    (frames, with_overrides(s, fmt), revision)
+}
+
+/// 설정에 저장 창의 값을 덮어쓴 사본. 모르는 이름이나 틀린 값이 섞여 있으면 원래 설정 그대로.
+fn with_overrides(s: Settings, fmt: SettingOverrides) -> Settings {
+    let Some(fmt) = fmt else { return s };
+    let Ok(serde_json::Value::Object(mut all)) = serde_json::to_value(&s) else { return s };
+    for (k, v) in fmt {
+        if all.contains_key(&k) {
+            all.insert(k, v);
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(all)).unwrap_or(s)
+}
+
+/// 저장이 끝난 뒤 "저장 안 한 변경 없음"으로 표시한다. 저장하는 동안 편집했으면 그대로 둔다.
+fn mark_saved(app: &AppHandle, revision: u64) {
+    let state = app.state::<AppState>();
+    let mut p = state.project.lock();
+    if p.revision == revision {
+        p.dirty = false;
+    }
+}
+
+/// 진행 중인 저장을 멈춘다 (저장 창의 "취소")
+#[tauri::command]
+fn cancel_export() {
+    export::set_cancel(true);
 }
 
 /// 이번 저장으로 덮어쓰게 될 파일을 찾는다.
 #[tauri::command]
-async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String) -> CmdResult<Vec<PathBuf>> {
-    let (frames, s) = snapshot(&app);
+async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String, fmt: SettingOverrides) -> CmdResult<Vec<PathBuf>> {
+    let (frames, s, _) = snapshot(&app, fmt);
     tauri::async_runtime::spawn_blocking(move || {
         export::planned_paths(&frames, Path::new(&path), &opts, &s).into_iter().filter(|p| p.exists()).collect()
     })
@@ -997,39 +1033,50 @@ async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String) -> 
 
 /// 저장한 파일 목록과 전체 크기를 돌려준다.
 #[tauri::command]
-async fn export_project(app: AppHandle, opts: ExportOptions, path: String) -> CmdResult<ExportResult> {
-    let (frames, s) = snapshot(&app);
+async fn export_project(app: AppHandle, opts: ExportOptions, path: String, fmt: SettingOverrides) -> CmdResult<ExportResult> {
+    let (frames, s, revision) = snapshot(&app, fmt);
     let h = app.clone();
-    let paths = tauri::async_runtime::spawn_blocking(move || {
+    export::set_cancel(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         export::export(&frames, Path::new(&path), &opts, &s, &|progress, msg| {
             let _ = h.emit("export-progress", ExportProgress { progress, message: msg.into() });
         })
     })
-    .await
-    .map_err(err)?
-    .map_err(|e| format!("{e:#}"))?;
+    .await;
+    export::set_cancel(false);
+    let paths = result.map_err(err)?.map_err(|e| format!("{e:#}"))?;
     let size = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-    app.state::<AppState>().project.lock().dirty = false;
+    mark_saved(&app, revision);
     Ok(ExportResult { paths, size, fit: None })
 }
 
 #[tauri::command]
-async fn export_project_fit(app: AppHandle, opts: ExportOptions, fit: export::FitOptions, path: String) -> CmdResult<ExportResult> {
-    let (frames, s) = snapshot(&app);
+async fn export_project_fit(
+    app: AppHandle,
+    opts: ExportOptions,
+    fit: export::FitOptions,
+    path: String,
+    fmt: SettingOverrides,
+) -> CmdResult<ExportResult> {
+    let (frames, s, revision) = snapshot(&app, fmt);
     let h = app.clone();
-    let (paths, fit) = tauri::async_runtime::spawn_blocking(move || {
+    export::set_cancel(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         export::export_fit(&frames, Path::new(&path), &opts, &fit, &s, &|progress, msg| {
             let _ = h.emit("export-progress", ExportProgress { progress, message: msg.into() });
         })
-    }).await.map_err(err)?.map_err(|e| format!("{e:#}"))?;
+    })
+    .await;
+    export::set_cancel(false);
+    let (paths, fit) = result.map_err(err)?.map_err(|e| format!("{e:#}"))?;
     let size = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-    app.state::<AppState>().project.lock().dirty = false;
+    mark_saved(&app, revision);
     Ok(ExportResult { paths, size, fit: Some(fit) })
 }
 
 #[tauri::command]
-async fn estimate_size(app: AppHandle, opts: ExportOptions) -> CmdResult<u64> {
-    let (frames, s) = snapshot(&app);
+async fn estimate_size(app: AppHandle, opts: ExportOptions, fmt: SettingOverrides) -> CmdResult<u64> {
+    let (frames, s, _) = snapshot(&app, fmt);
     tauri::async_runtime::spawn_blocking(move || export::estimate_size(&frames, &opts, &s))
         .await
         .map_err(err)?
@@ -2082,6 +2129,7 @@ pub fn run() {
             append_files,
             new_blank,
             make_collage,
+            cancel_export,
             list_files,
             rename_file,
             file_bytes,
@@ -2102,6 +2150,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_dialog_overrides_change_only_the_copy() {
+        let s = Settings::default();
+        let mut fmt = serde_json::Map::new();
+        fmt.insert("webpLossless".into(), serde_json::Value::Bool(!s.webp_lossless));
+        fmt.insert("없는이름".into(), serde_json::Value::Bool(true));
+        let changed = with_overrides(s.clone(), Some(fmt));
+        assert_eq!(changed.webp_lossless, !s.webp_lossless);
+        assert_eq!(changed.fps, s.fps);
+        // 값의 종류가 틀리면 원래 설정 그대로
+        let mut bad = serde_json::Map::new();
+        bad.insert("webpLossless".into(), serde_json::Value::String("예".into()));
+        assert_eq!(with_overrides(s.clone(), Some(bad)).webp_lossless, s.webp_lossless);
+    }
 
     #[test]
     fn frame_request_does_not_block_parallel_edit() {
