@@ -9,7 +9,8 @@ const Screen = window.location.hash === "#recorder" ? lazy(() => import("./Recor
 
 // 기본 오른쪽 클릭 메뉴(새로 고침 등)는 막는다
 window.addEventListener("contextmenu", (e) => {
-  if (!(e.target instanceof HTMLInputElement)) e.preventDefault();
+  // 글자를 넣는 칸(한 줄·여러 줄)에서는 붙여넣기 메뉴를 쓸 수 있게 둔다
+  if (!(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) e.preventDefault();
 });
 
 /** 화면 코드에서 오류가 나도 하얀 창 대신 내용을 보여준다. 편집 중인 프레임은 Rust 쪽에 남아 있다. */

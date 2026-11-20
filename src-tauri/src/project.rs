@@ -625,11 +625,11 @@ impl Project {
     }
 
     /// 모든 프레임에서 바깥쪽 투명 픽셀을 걷어낸 영역
-    pub fn trim_bounds(&self) -> Option<(u32, u32, u32, u32)> {
-        let f0 = self.frames.first()?;
+    /// 프레임 목록만으로 계산한다 (프로젝트 잠금을 쥐지 않고 돌릴 수 있게)
+    pub fn bounds_of(frames: &[Frame]) -> Option<(u32, u32, u32, u32)> {
+        let f0 = frames.first()?;
         let (w, h) = (f0.width, f0.height);
-        let b = self
-            .frames
+        let b = frames
             .par_iter()
             .filter_map(|f| {
                 let px = f.rgba();

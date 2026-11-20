@@ -930,9 +930,12 @@ async fn edit(app: AppHandle, op: EditOp) -> CmdResult<ProjectView> {
 }
 
 /// 바깥쪽 투명 테두리를 걷어낸 영역 (자르기의 "자동 맞춤")
-#[tauri::command]
-fn trim_bounds(state: State<AppState>) -> Option<(u32, u32, u32, u32)> {
-    state.project.lock().trim_bounds()
+// 메인 스레드가 아닌 곳에서 돌리고, 프로젝트 잠금은 프레임 목록을 복사하는 동안만 잡는다.
+// 큰 녹화에서는 모든 프레임을 풀어 보느라 오래 걸려, 그동안 창이 "응답 없음"이 되고 다른 명령도 기다렸다.
+#[tauri::command(async)]
+fn trim_bounds(app: AppHandle) -> Option<(u32, u32, u32, u32)> {
+    let frames = app.state::<AppState>().project.lock().frames.clone();
+    Project::bounds_of(&frames)
 }
 
 // ---------- 저장 ----------
@@ -944,7 +947,7 @@ fn default_save_path(state: State<AppState>, ext: String) -> String {
     export::unique_path(Path::new(&s.output_dir), &name, &ext).to_string_lossy().into_owned()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_save_path(app: AppHandle, current: String, ext: String) -> Option<String> {
     let cur = PathBuf::from(&current);
     let mut d = app.dialog().file().add_filter(ext.to_uppercase(), &[&ext]);
@@ -957,7 +960,7 @@ fn pick_save_path(app: AppHandle, current: String, ext: String) -> Option<String
     d.blocking_save_file()?.into_path().ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_folder(app: AppHandle, current: String) -> Option<String> {
     app.dialog()
         .file()
@@ -1237,7 +1240,7 @@ async fn filter_preview(app: AppHandle, id: u64, filters: Vec<Filter>) -> CmdRes
 
 // ---------- 열기 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_open_files(app: AppHandle) -> Option<Vec<String>> {
     let all: Vec<&str> = import::IMAGE_EXTS.iter().chain(import::VIDEO_EXTS).copied().collect();
     let picked = app
@@ -1355,7 +1358,7 @@ struct FileEntry {
 }
 
 /// 저장 폴더의 움짤·동영상·이미지 목록
-#[tauri::command]
+#[tauri::command(async)]
 fn list_files(dir: String) -> CmdResult<Vec<FileEntry>> {
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
@@ -1527,7 +1530,7 @@ async fn export_frames(
 }
 
 /// 저장 대화상자 (형식 목록을 받아서)
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_save_file(app: AppHandle, current: String, filters: Vec<(String, Vec<String>)>) -> Option<String> {
     let cur = PathBuf::from(&current);
     let mut d = app.dialog().file();
@@ -1545,7 +1548,7 @@ fn pick_save_file(app: AppHandle, current: String, filters: Vec<(String, Vec<Str
 }
 
 /// 파일 하나 고르기
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_file(app: AppHandle, filters: Vec<(String, Vec<String>)>) -> Option<String> {
     let mut d = app.dialog().file();
     for (name, exts) in &filters {

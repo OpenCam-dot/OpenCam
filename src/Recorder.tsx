@@ -467,7 +467,8 @@ export default function Recorder() {
   useEffect(() => {
     const onKey = async (e: KeyboardEvent) => {
       if (!settings || !layout) return;
-      if ((e.target as HTMLElement).tagName === "INPUT") return;
+      // 입력칸·목록에서 누른 키는 그 칸의 것이다 (목록에서 방향키로 고르는데 창이 움직이지 않게)
+      if (["INPUT", "SELECT", "TEXTAREA"].includes((e.target as HTMLElement).tagName)) return;
       if (!recording && e.ctrlKey && e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         if (!e.repeat) await chooseWindow();

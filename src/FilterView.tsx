@@ -4,7 +4,7 @@ import { useContext, useEffect, useRef, useState } from "react";
 import { IconEye } from "@tabler/icons-react";
 import { api, Filter, FrameInfo, frameUrl, hexToRgb, Region } from "./api";
 import { Check, isModalOpen } from "./dialogs";
-import { promptAsk } from "./ask";
+import { confirmAsk, promptAsk } from "./ask";
 import SidePanel from "./SidePanel";
 import { ColorInput, defaultScope, Field, FrameContext, PanelFoot, Scope, ScopePicker, scopeSel, Section, Slider, usePngPreview, useReportDirty } from "./Panel";
 
@@ -273,6 +273,8 @@ export default function FilterView({ frame, scale, onApply, onCancel, onError }:
   const [showOriginal, setShowOriginal] = useState(false);
   const [scope, setScope] = useState<Scope>(() => defaultScope(frames));
   const [presets, setPresets] = useState(loadPresets);
+  /** 방금 불러온 저장 설정의 이름 (지우기 단추를 보여 주려고) */
+  const [loaded, setLoaded] = useState("");
   const drag = useRef<{ ax: number; ay: number } | null>(null);
   const box = useRef<HTMLDivElement>(null);
 
@@ -382,14 +384,16 @@ export default function FilterView({ frame, scale, onApply, onCancel, onError }:
         const k = `${d.kind}.${c.key}`;
         return <Check key={k} label={c.label} checked={Number(st.values[k]) === 1} onChange={(v) => setVal(k, v ? 1 : 0)} />;
       })}
-      {d.region && !d.regionRequired && (
+      {d.region && (
         <Field label="영역">
+          {/* 영역이 꼭 있어야 하는 필터(지우개)는 "전체 화면" 없이 모양만 고른다. 예전에는 이 칸이 없어서,
+              다른 필터에서 타원을 골라 둔 채로는 사각형으로 돌아올 수 없었다. */}
           <select
             aria-label="필터를 쓸 영역"
-            value={st.regionMode}
+            value={d.regionRequired && st.regionMode === "all" ? "rect" : st.regionMode}
             onChange={(e) => setSt((s) => ({ ...s, regionMode: e.target.value as State["regionMode"] }))}
           >
-            <option value="all">전체 화면</option>
+            {!d.regionRequired && <option value="all">전체 화면</option>}
             <option value="rect">사각형 (미리보기에서 드래그)</option>
             <option value="ellipse">타원 (미리보기에서 드래그)</option>
           </select>
@@ -511,7 +515,15 @@ export default function FilterView({ frame, scale, onApply, onCancel, onError }:
               disabled={Object.keys(presets).length === 0}
               onChange={(e) => {
                 const p = presets[e.target.value];
-                if (p) setSt(p);
+                if (!p) return;
+                // 예전 버전에서 저장한 설정에는 그 뒤에 생긴 필터의 값이 없다. 없는 값은 기본값으로 채운다.
+                const base = initialState();
+                setSt({
+                  on: { ...p.on },
+                  values: { ...base.values, ...p.values },
+                  regionMode: ["all", "rect", "ellipse"].includes(p.regionMode) ? p.regionMode : "all",
+                });
+                setLoaded(e.target.value);
               }}
             >
               <option value="">{Object.keys(presets).length ? "저장한 설정 고르기" : "저장한 설정 없음"}</option>
@@ -522,6 +534,26 @@ export default function FilterView({ frame, scale, onApply, onCancel, onError }:
               ))}
             </select>
           </Field>
+          {loaded && presets[loaded] && (
+            <div className="row">
+              <button
+                onClick={async () => {
+                  if (!(await confirmAsk(`저장한 설정 "${loaded}"을(를) 지울까요?`, "지우기"))) return;
+                  const next = { ...presets };
+                  delete next[loaded];
+                  setPresets(next);
+                  setLoaded("");
+                  try {
+                    localStorage.setItem(PRESET_KEY, JSON.stringify(next));
+                  } catch {
+                    onError("설정을 저장하지 못했습니다");
+                  }
+                }}
+              >
+                "{loaded}" 지우기
+              </button>
+            </div>
+          )}
         </Section>
       </SidePanel>
     </div>
