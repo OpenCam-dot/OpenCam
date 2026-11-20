@@ -331,16 +331,60 @@ fn parse_ffmpeg_info_inner(text: &str) -> Option<(VideoInfo, Option<u64>)> {
         return None;
     }
     // 휴대폰 동영상은 돌려서 보여주라는 표시가 있다. ffmpeg는 자동으로 돌리므로 가로·세로를 바꿔 둔다.
-    let rotated = text.lines().any(|l| {
-        let l = l.trim();
-        (l.starts_with("rotate") && (l.contains("90") || l.contains("270")))
-            || (l.contains("rotation of") && (l.contains("90") || l.contains("270")))
-    });
-    if rotated {
+    if is_rotated_sideways(text) {
         std::mem::swap(&mut width, &mut height);
     }
     let fps = if fps.is_finite() { fps.clamp(1.0, 240.0) } else { 30.0 };
     Some((VideoInfo { width, height, duration_ms: duration.unwrap_or(0), fps }, duration))
+}
+
+/// 돌려서 보여주라는 표시가 90°나 270°인가. 표시는 두 가지 모양으로 온다:
+/// `rotate          : 90` 과 `displaymatrix: rotation of -90.00 degrees`.
+/// 숫자를 읽어서 판단한다. 글자가 들어 있는지만 보면 파일 이름("rotation of 90.mp4")이나
+/// `-0.90 degrees` 같은 값에도 걸려 가로·세로가 뒤바뀌었다.
+fn is_rotated_sideways(info: &str) -> bool {
+    let sideways = |deg: f64| {
+        let q = (deg.round() as i64).rem_euclid(360);
+        q == 90 || q == 270
+    };
+    info.lines().map(str::trim).filter(|l| !l.starts_with("Input #")).any(|l| {
+        if let Some(v) = l.strip_prefix("rotate").and_then(|r| r.trim_start().strip_prefix(':')) {
+            return v.trim().parse::<f64>().is_ok_and(sideways);
+        }
+        l.split("rotation of ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(sideways)
+    })
+}
+
+/// 길이 확인이 이보다 오래 걸리면 그만둔다 (아주 큰 파일을 끝까지 훑느라 창이 한없이 기다리지 않게)
+const SCAN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 명령을 돌려 stdout을 받는다. limit 안에 끝나지 않으면 끄고 None.
+fn output_within(mut cmd: Command, limit: std::time::Duration) -> Result<Option<(bool, String)>> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("ffmpeg 실행 실패")?;
+    let mut out = child.stdout.take().context("ffmpeg 출력을 읽을 수 없습니다")?;
+    // 출력은 다른 스레드에서 읽는다 (읽어 주지 않으면 출력이 많을 때 ffmpeg가 멈춘다)
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text);
+        text
+    });
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some((status.success(), reader.join().unwrap_or_default())));
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
 }
 
 /// 일반 진행 출력의 time=과 -progress의 out_time=을 모두 읽는다.
@@ -361,10 +405,12 @@ fn scan_video_duration(path: &str) -> Result<u64> {
         if copy {
             cmd.args(["-c:v", "copy"]);
         }
-        // output()으로 stdout과 stderr를 함께 읽고, 키보드 입력도 기다리지 않는다.
-        let out = cmd.args(["-f", "null", "-"]).stdin(Stdio::null()).output().context("ffmpeg 실행 실패")?;
-        if out.status.success()
-            && let Some(ms) = parse_ffmpeg_progress_time(&String::from_utf8_lossy(&out.stdout))
+        cmd.args(["-f", "null", "-"]);
+        let Some((ok, text)) = output_within(cmd, SCAN_LIMIT)? else {
+            bail!("동영상 길이를 확인하는 데 너무 오래 걸려 그만두었습니다. 다른 동영상 파일로 저장한 뒤 다시 열어 주세요.");
+        };
+        if ok
+            && let Some(ms) = parse_ffmpeg_progress_time(&text)
             && ms > 0
         {
             return Ok(ms);
@@ -677,6 +723,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("그림이 너무 커서 불러올 수 없습니다 (65535×65535)"), "{msg}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rotation_is_read_from_the_number_not_from_any_text() {
+        let stream = "  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps\n";
+        let info = |extra: &str| format!("Input #0, mov, from 'a.mp4':\n  Duration: 00:00:01.00\n{stream}{extra}");
+        let size = |text: String| parse_ffmpeg_info(&text).map(|i| (i.width, i.height)).unwrap();
+        assert_eq!(size(info("")), (1920, 1080));
+        assert_eq!(size(info("    rotate          : 90\n")), (1080, 1920));
+        assert_eq!(size(info("      displaymatrix: rotation of -90.00 degrees\n")), (1080, 1920));
+        assert_eq!(size(info("      displaymatrix: rotation of 270.00 degrees\n")), (1080, 1920));
+        // 돌리지 않는 값들
+        assert_eq!(size(info("      displaymatrix: rotation of -0.90 degrees\n")), (1920, 1080));
+        assert_eq!(size(info("      displaymatrix: rotation of 180.00 degrees\n")), (1920, 1080));
+        assert_eq!(size(info("    rotate          : 0\n")), (1920, 1080));
+        // 파일 이름에 같은 글자가 있어도 걸리지 않는다
+        let named = format!("Input #0, mov, from 'rotation of 90.mp4':\n  Duration: 00:00:01.00\n{stream}");
+        assert_eq!(size(named), (1920, 1080));
     }
 
     #[test]
