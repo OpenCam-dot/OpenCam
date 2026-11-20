@@ -454,6 +454,9 @@ export function UpscaleDialog({
       onClose={onClose}
       onOk={() => onApply(k)}
       okText="확대하기"
+      disabledReason={
+        Math.max(width, height) * k > 8192 ? "결과가 너무 큽니다 (한 변 8192픽셀까지). 배율을 낮추거나 먼저 크기를 줄이세요" : null
+      }
       target="전체 프레임에 적용"
       summary={
         <>

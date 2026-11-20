@@ -911,7 +911,12 @@ async fn edit(app: AppHandle, op: EditOp) -> CmdResult<ProjectView> {
             EditOp::Transition { sel, kind, ms } => p.transition(&sel, kind, ms),
             EditOp::Zoom { start, zoom } => p.zoom_fx(start, &zoom),
             EditOp::Summarize { options } => p.summarize(options),
-            EditOp::Upscale { factor } => p.upscale(factor),
+            EditOp::Upscale { factor } => {
+                let max = state.settings.lock().max_edit_bytes();
+                if let Err(e) = p.upscale(factor, max) {
+                    message = Some(e);
+                }
+            }
         }
         view(&p, selection, message)
     })
@@ -1224,7 +1229,11 @@ async fn make_collage(
     options: collage::CollageOptions,
 ) -> CmdResult<ProjectView> {
     let max = memory_limit(&app);
-    let current = if use_current { app.state::<AppState>().project.lock().frames.clone() } else { vec![] };
+    let (current, revision) = {
+        let state = app.state::<AppState>();
+        let p = state.project.lock();
+        (if use_current { p.frames.clone() } else { vec![] }, p.revision)
+    };
     let progress = import_progress(&app);
     let frames = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<Vec<frame::Frame>> {
         let mut clips = vec![];
@@ -1243,11 +1252,22 @@ async fn make_collage(
             None => None,
         };
         progress(0.6, "콜라주 만드는 중");
-        collage::make(&clips, &options, bg)
+        collage::make(&clips, &options, bg, max)
     })
     .await
     .map_err(err)?
     .map_err(|e| format!("{e:#}"))?;
+    if use_current {
+        // 지금 편집 중인 영상을 넣었으면 새로 여는 것이 아니라 편집 한 번으로 친다.
+        // 새로 열면 되돌리기 기록이 지워져 원래 영상으로 돌아갈 수 없었다.
+        let state = app.state::<AppState>();
+        let mut p = state.project.lock();
+        if p.revision != revision {
+            return Err("콜라주를 만드는 동안 편집 내용이 바뀌어 적용하지 않았습니다. 다시 만들어 주세요".into());
+        }
+        p.replace(frames);
+        return Ok(view(&p, Some(vec![]), None));
+    }
     Ok(start_editing(&app, import::Loaded { frames, warning: None, memory_limited: false }, true))
 }
 

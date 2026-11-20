@@ -656,9 +656,51 @@ impl Project {
     }
 
     /// 2·3·4배 초해상도 (학습된 ESPCN 모델, `superres.rs`)
-    pub fn upscale(&mut self, factor: u32) {
+    /// 결과가 너무 크거나 편집 메모리 한도(max_bytes)를 넘으면 아무것도 바꾸지 않고 까닭을 돌려준다.
+    ///
+    /// 프레임은 한 장씩 차례로 키운다(한 장 안에서는 여러 코어를 쓴다). 여러 장을 동시에 키우면
+    /// 장마다 수백 MB씩 잡아 메모리가 모자랐다. 같은 그림을 함께 쓰는 프레임(빈 영상, 복제한 프레임)은 한 번만 키운다.
+    pub fn upscale(&mut self, factor: u32, max_bytes: usize) -> Result<(), String> {
         let k = factor.clamp(2, 4);
-        self.map_all(move |w, h, px| crate::superres::upscale_rgba(w, h, &px, k));
+        let Some(f0) = self.frames.first() else { return Ok(()) };
+        let max = crate::superres::MAX_SIDE;
+        if f0.width.saturating_mul(k) > max || f0.height.saturating_mul(k) > max {
+            return Err(format!(
+                "확대한 크기({} × {})가 너무 큽니다. 한 변이 {max}픽셀을 넘지 않게 배율을 낮추거나 먼저 크기를 줄여 주세요",
+                f0.width as u64 * k as u64,
+                f0.height as u64 * k as u64
+            ));
+        }
+        let mut done: std::collections::HashMap<usize, Frame> = std::collections::HashMap::new();
+        let mut bytes = 0usize;
+        let mut out = Vec::with_capacity(self.frames.len());
+        for f in &self.frames {
+            let big = match done.get(&f.packed_key()) {
+                Some(b) => b.clone(),
+                None => {
+                    let b = f.map_pixels(|w, h, px| crate::superres::upscale_rgba(w, h, &px, k));
+                    bytes += b.packed_bytes();
+                    if bytes > max_bytes {
+                        return Err("확대한 결과가 편집 메모리 한도를 넘어 확대하지 않았습니다 (설정에서 한도를 바꾸거나 프레임 수·배율을 줄여 주세요)".into());
+                    }
+                    done.insert(f.packed_key(), b.clone());
+                    b
+                }
+            };
+            // 그림은 함께 쓰고, 시간·이름표는 프레임마다 제 것으로
+            let mut nf = big.duplicate().with_delay(f.delay_ms);
+            nf.tags = f.tags;
+            out.push(nf);
+        }
+        self.checkpoint();
+        self.frames = out;
+        Ok(())
+    }
+
+    /// 프레임 전체를 새것으로 바꾼다 (콜라주처럼 지금 영상으로 새 영상을 만들 때). 되돌리기 한 번으로 돌아온다.
+    pub fn replace(&mut self, frames: Vec<Frame>) {
+        self.checkpoint();
+        self.frames = frames;
     }
 
     /// 맨 뒤에 프레임을 붙인다 (파일 끌어 놓기, 되돌리기 한 번). 붙인 프레임의 번호들.
@@ -820,6 +862,43 @@ mod tests {
         assert!(is_similar(&a, &c, 10, 10, 0.01, 20));
         // 비율 0이면 완전히 같을 때만
         assert!(!is_similar(&a, &c, 10, 10, 0.0, 20));
+    }
+
+    #[test]
+    fn upscale_shares_pictures_and_refuses_what_is_too_big() {
+        let mut p = Project::default();
+        p.set_undo_enabled(true);
+        let a = solid(8, 6, 10, 100);
+        let mut tagged = a.with_delay(50);
+        tagged.tags = 3;
+        p.load(vec![a.clone(), tagged, solid(8, 6, 200, 70)]);
+        p.upscale(2, usize::MAX).unwrap();
+        assert!(p.frames.iter().all(|f| (f.width, f.height) == (16, 12)));
+        // 같은 그림을 쓰던 두 장은 키운 뒤에도 그림을 함께 쓰고, 시간·이름표는 제 것 그대로
+        assert_eq!(p.frames[0].packed_key(), p.frames[1].packed_key());
+        assert_ne!(p.frames[0].packed_key(), p.frames[2].packed_key());
+        assert_eq!(p.frames.iter().map(|f| (f.delay_ms, f.tags)).collect::<Vec<_>>(), [(100, 0), (50, 3), (70, 0)]);
+        assert!(p.undo());
+        assert_eq!(p.frames[0].width, 8);
+        // 메모리 한도를 넘으면 바꾸지 않는다 (되돌리기 기록도 늘지 않는다)
+        assert!(p.upscale(2, 1).is_err());
+        assert_eq!(p.frames[0].width, 8);
+        assert!(!p.can_undo());
+        // 한 변이 너무 커지면 바꾸지 않는다
+        p.load(vec![solid(4000, 1, 0, 100)]);
+        assert!(p.upscale(4, usize::MAX).is_err());
+        assert_eq!(p.frames[0].width, 4000);
+    }
+
+    #[test]
+    fn replace_can_be_undone() {
+        let mut p = Project::default();
+        p.set_undo_enabled(true);
+        p.load(vec![solid(8, 8, 10, 100)]);
+        p.replace(vec![solid(20, 10, 1, 30), solid(20, 10, 2, 30)]);
+        assert_eq!(p.frames.len(), 2);
+        assert!(p.undo());
+        assert_eq!((p.frames.len(), p.frames[0].width), (1, 8));
     }
 
     #[test]

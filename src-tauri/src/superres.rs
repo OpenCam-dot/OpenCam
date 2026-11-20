@@ -50,24 +50,45 @@ impl Espcn {
     }
 
     /// 밝기(h×w, 0~1)를 r배로 키운다. 결과는 (h·r)×(w·r).
+    ///
+    /// 가로 띠로 나눠 계산한다. 한꺼번에 하면 중간 결과(픽셀마다 64+32개 값)가 1080p에서 약 800MB라
+    /// 큰 그림을 키우다 메모리가 모자라 앱이 꺼졌다. 띠마다 위아래로 `HALO`줄을 더 계산해서
+    /// 버리므로 결과는 한꺼번에 한 것과 같다 (세 층이 보는 범위가 위아래 2+1+1줄).
     fn run(&self, y: &[f32], h: usize, w: usize) -> Vec<f32> {
-        let l1 = conv(y, h, w, &self.layers[0], true);
-        let l2 = conv(&l1, h, w, &self.layers[1], true);
-        let l3 = conv(&l2, h, w, &self.layers[2], false);
-        // 픽셀 재배치(depth_to_space): 출력 (y·r+dy, x·r+dx) = 채널 dy·r+dx
+        const HALO: usize = 4;
+        // 띠 하나의 중간 결과가 약 32MB를 넘지 않게 (최소 16줄)
+        let band = ((32 << 20) / (w.max(1) * 96 * 4)).max(16);
         let r = self.r;
         let (ow, oh) = (w * r, h * r);
         let mut out = vec![0f32; ow * oh];
-        out.par_chunks_mut(ow).enumerate().for_each(|(oy, row)| {
-            let (sy, dy) = (oy / r, oy % r);
-            for (ox, o) in row.iter_mut().enumerate() {
-                let (sx, dx) = (ox / r, ox % r);
-                *o = l3[(sy * w + sx) * r * r + dy * r + dx].tanh();
-            }
-        });
+        let mut top = 0;
+        while top < h {
+            let bottom = (top + band).min(h);
+            // 띠에 위아래 여유를 붙인 범위 (그림 밖으로는 안 나감: 그림 가장자리는 원래대로 0으로 채워진다)
+            let (y0, y1) = (top.saturating_sub(HALO), (bottom + HALO).min(h));
+            let bh = y1 - y0;
+            let l1 = conv(&y[y0 * w..y1 * w], bh, w, &self.layers[0], true);
+            let l2 = conv(&l1, bh, w, &self.layers[1], true);
+            drop(l1);
+            let l3 = conv(&l2, bh, w, &self.layers[2], false);
+            drop(l2);
+            // 픽셀 재배치(depth_to_space): 출력 (y·r+dy, x·r+dx) = 채널 dy·r+dx
+            out[top * r * ow..bottom * r * ow].par_chunks_mut(ow).enumerate().for_each(|(k, row)| {
+                let oy = top * r + k;
+                let (sy, dy) = (oy / r - y0, oy % r);
+                for (ox, o) in row.iter_mut().enumerate() {
+                    let (sx, dx) = (ox / r, ox % r);
+                    *o = l3[(sy * w + sx) * r * r + dy * r + dx].tanh();
+                }
+            });
+            top = bottom;
+        }
         out
     }
 }
+
+/// 고품질 확대 결과의 한 변 최대 길이 (새 빈 영상의 최대 크기와 같다)
+pub const MAX_SIDE: u32 = 8192;
 
 /// 같은 크기 출력의 합성곱 (모자란 가장자리는 0, TF의 SAME). 자료는 [y][x][채널].
 fn conv(input: &[f32], h: usize, w: usize, l: &Conv, relu: bool) -> Vec<f32> {
@@ -151,6 +172,26 @@ mod tests {
             for ((yy, xx), e) in at.iter().zip(want) {
                 let got = out[yy * ow + xx];
                 assert!((got - e).abs() < 1e-4, "x{r} ({yy},{xx}): {got} != {e}");
+            }
+        }
+    }
+
+    /// 띠로 나눠 계산해도(이 크기면 띠가 여러 개) 한꺼번에 계산한 것과 값이 같다
+    #[test]
+    fn bands_give_the_same_result_as_one_pass() {
+        let (h, w) = (70usize, 5000usize);
+        let y: Vec<f32> = (0..h * w).map(|i| ((i * 7919 + i / w * 13) % 251) as f32 / 250.0).collect();
+        let m = Espcn::new(2);
+        let got = m.run(&y, h, w);
+        // 한꺼번에: 예전 계산 그대로
+        let l1 = conv(&y, h, w, &m.layers[0], true);
+        let l2 = conv(&l1, h, w, &m.layers[1], true);
+        let l3 = conv(&l2, h, w, &m.layers[2], false);
+        let (r, ow) = (2usize, w * 2);
+        for oy in 0..h * r {
+            for ox in (0..ow).step_by(37) {
+                let want = l3[((oy / r) * w + ox / r) * r * r + (oy % r) * r + ox % r].tanh();
+                assert_eq!(got[oy * ow + ox], want, "({oy},{ox})");
             }
         }
     }
