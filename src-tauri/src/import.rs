@@ -256,6 +256,15 @@ pub struct VideoInfo {
     pub fps: f32,
 }
 
+/// ffmpeg에 넘길 입력 파일 경로를 확인한다: 전체 경로만 받는다.
+/// `-`로 시작하는 이름은 ffmpeg가 옵션으로 읽고, `http://…` 같은 주소는 인터넷에서 받아 오므로 막는다.
+fn local_input(path: &str) -> Result<&str> {
+    if !Path::new(path).is_absolute() {
+        bail!("파일의 전체 경로가 아니어서 열 수 없습니다");
+    }
+    Ok(path)
+}
+
 fn ffmpeg_command() -> Result<Command> {
     crate::export::ffmpeg().ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. 동영상을 열려면 ffmpeg가 필요합니다."))
 }
@@ -365,6 +374,7 @@ fn scan_video_duration(path: &str) -> Result<u64> {
 }
 
 pub fn probe_video(path: &str) -> Result<VideoInfo> {
+    let path = local_input(path)?;
     let out = ffmpeg_command()?
         .args(["-hide_banner", "-i", path])
         .stdin(Stdio::null())
@@ -383,6 +393,7 @@ pub fn probe_video(path: &str) -> Result<VideoInfo> {
 
 /// 구간을 고를 때 보여줄 장면 하나 (가로 max_w 이하 PNG)
 pub fn video_frame_png(path: &str, at_ms: u64, max_w: u32) -> Result<Vec<u8>> {
+    let path = local_input(path)?;
     let out = ffmpeg_command()?
         .args(["-v", "error", "-ss", &format!("{:.3}", at_ms as f64 / 1000.0), "-i", path])
         .args(stream_args(path)?)
@@ -534,6 +545,7 @@ fn load_video_inner(
     max_bytes: usize,
     progress: Progress,
 ) -> Result<Loaded> {
+    let path = local_input(path)?;
     if end_ms <= start_ms {
         bail!("구간이 비었습니다");
     }
@@ -670,7 +682,7 @@ mod tests {
     #[test]
     fn huge_video_is_rejected_without_ffmpeg() {
         for (w, h) in [(32768, 32768), (65535, 65535), (u32::MAX, u32::MAX)] {
-            let err = load_video("없는_파일.mp4", 0, 1000, 30.0, w, h, usize::MAX, &|_, _| {})
+            let err = load_video("C:/없는_파일.mp4", 0, 1000, 30.0, w, h, usize::MAX, &|_, _| {})
                 .err()
                 .expect("너무 큰 동영상은 거부해야 합니다");
             assert!(err.to_string().contains("동영상 크기가 너무 커서 불러올 수 없습니다"), "{err}");

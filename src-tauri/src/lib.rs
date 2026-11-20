@@ -1093,10 +1093,32 @@ fn reveal_file(path: String) -> CmdResult<()> {
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(err)
 }
 
+/// 파일 관리 명령(지우기·이름 바꾸기·미리보기)이 다뤄도 되는 파일인지 확인한다:
+/// 전체 경로로 적힌, 이 프로그램이 다루는 그림·동영상 파일 하나.
+/// 화면 쪽이 잘못된 경로를 보내도 폴더나 다른 종류의 파일을 지우거나 읽지 않게 한다.
+/// (상대 경로를 휴지통 함수에 넘기면 휴지통을 거치지 않고 바로 지워질 수 있고, `*`는 여러 파일로 풀린다.)
+fn managed_file(path: &str) -> CmdResult<PathBuf> {
+    let p = PathBuf::from(path);
+    let ext = import::ext_of(&p);
+    let media = import::IMAGE_EXTS.contains(&ext.as_str()) || import::VIDEO_EXTS.contains(&ext.as_str());
+    if !p.is_absolute() || path.contains(['*', '?', '\0']) || !media {
+        return Err("다룰 수 없는 파일입니다 (그림·동영상 파일의 전체 경로만 됩니다)".into());
+    }
+    if !p.is_file() {
+        return Err("파일이 없습니다".into());
+    }
+    Ok(p)
+}
+
 /// 저장한 파일 지우기 (설정에 따라 휴지통으로)
 #[tauri::command]
 fn delete_file(state: State<AppState>, path: String) -> CmdResult<()> {
-    if state.settings.lock().delete_to_recycle_bin { recycle(&path) } else { std::fs::remove_file(&path).map_err(err) }
+    let file = managed_file(&path)?;
+    if state.settings.lock().delete_to_recycle_bin {
+        recycle(&file.to_string_lossy())
+    } else {
+        std::fs::remove_file(&file).map_err(err)
+    }
 }
 
 #[cfg(windows)]
@@ -1373,7 +1395,7 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
     if new_name.is_empty() || new_name.chars().any(|c| BAD.contains(c)) {
         return Err("파일 이름에 쓸 수 없는 글자가 있습니다 (\\ / : * ? \" < > |)".into());
     }
-    let old = PathBuf::from(&path);
+    let old = managed_file(&path)?;
     let mut name = new_name.to_string();
     let typed = import::ext_of(std::path::Path::new(&name));
     if !(import::IMAGE_EXTS.contains(&typed.as_str()) || import::VIDEO_EXTS.contains(&typed.as_str()))
@@ -1382,7 +1404,9 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
         name = format!("{name}.{}", ext.to_string_lossy());
     }
     let new = old.with_file_name(name);
-    if new.exists() {
+    // Windows는 대소문자를 가리지 않아 a.gif → A.gif는 "이미 있는 파일"로 보인다. 같은 파일이면 그대로 바꾼다.
+    let same_file = new.to_string_lossy().to_lowercase() == old.to_string_lossy().to_lowercase();
+    if !same_file && new.exists() {
         return Err("같은 이름의 파일이 이미 있습니다".into());
     }
     std::fs::rename(&old, &new).map_err(err)?;
@@ -1393,6 +1417,7 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
 #[tauri::command]
 async fn file_bytes(path: String) -> CmdResult<tauri::ipc::Response> {
     tauri::async_runtime::spawn_blocking(move || {
+        let path = managed_file(&path)?;
         let len = std::fs::metadata(&path).map_err(err)?.len();
         if len > 100 * 1024 * 1024 {
             return Err("파일이 너무 커서 미리 볼 수 없습니다".to_string());
@@ -2441,8 +2466,19 @@ mod tests {
         assert!(rename_file(b.clone(), "a/b".into()).is_err());
         std::fs::write(dir.join("c.gif"), b"y").unwrap();
         assert!(rename_file(b.clone(), "c".into()).is_err());
-        // 목록에는 지원하는 파일만
+        // 대소문자만 바꾸는 것은 된다 (Windows에서는 같은 파일이라 "이미 있음"으로 보였다)
+        let upper = rename_file(b.clone(), "새 이름.GIF".into()).unwrap();
+        assert!(upper.ends_with("새 이름.GIF"));
+        let b = rename_file(upper, "새 이름.gif".into()).unwrap();
+        // 그림·동영상이 아닌 파일, 폴더, 상대 경로, 별표가 든 경로는 다루지 않는다
         std::fs::write(dir.join("memo.txt"), b"z").unwrap();
+        assert!(managed_file(&dir.join("memo.txt").to_string_lossy()).is_err());
+        assert!(managed_file(&dir.to_string_lossy()).is_err());
+        assert!(managed_file("a.gif").is_err());
+        assert!(managed_file(&dir.join("*.gif").to_string_lossy()).is_err());
+        assert!(managed_file(&b).is_ok());
+        assert!(rename_file(dir.join("memo.txt").to_string_lossy().into_owned(), "x".into()).is_err());
+        // 목록에는 지원하는 파일만
         let names: Vec<String> =
             list_files(dir.to_string_lossy().into_owned()).unwrap().into_iter().map(|f| f.name).collect();
         assert_eq!(names.len(), 2);
