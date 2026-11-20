@@ -48,13 +48,24 @@ pub struct Frame {
     pub delay_ms: u32,
     /// 입힌 효과 종류 (`tag`의 비트를 합친 것)
     pub tags: u8,
+    /// 픽셀 버퍼의 번호. 같은 그림을 함께 쓰는 프레임(시간만 바꾼 복사본, 복제, 빈 영상)은 번호가 같다.
+    /// 작업 자동 저장이 같은 그림을 파일 하나로만 쓰는 데 쓴다.
+    pixels: u64,
     packed: Arc<Vec<u8>>,
 }
 
 impl Frame {
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8], delay_ms: u32) -> Self {
         debug_assert_eq!(rgba_len(width, height), Some(rgba.len()), "프레임 크기와 픽셀 데이터가 맞지 않습니다");
-        Frame { id: new_id(), width, height, delay_ms, tags: 0, packed: Arc::new(lz4_flex::compress_prepend_size(rgba)) }
+        Frame {
+            id: new_id(),
+            width,
+            height,
+            delay_ms,
+            tags: 0,
+            pixels: new_id(),
+            packed: Arc::new(lz4_flex::compress_prepend_size(rgba)),
+        }
     }
 
     pub fn rgba(&self) -> Vec<u8> {
@@ -82,7 +93,12 @@ impl Frame {
             return None;
         }
         let px = lz4_flex::decompress_size_prepended(&packed).ok()?;
-        (px.len() == len).then(|| Frame { id: new_id(), width, height, delay_ms, tags, packed: Arc::new(packed) })
+        (px.len() == len).then(|| Frame { id: new_id(), width, height, delay_ms, tags, pixels: new_id(), packed: Arc::new(packed) })
+    }
+
+    /// 픽셀 버퍼의 번호 (같은 그림을 함께 쓰는 프레임은 같다)
+    pub fn pixels_id(&self) -> u64 {
+        self.pixels
     }
 
     /// 압축된 픽셀 (작업 자동 저장용)

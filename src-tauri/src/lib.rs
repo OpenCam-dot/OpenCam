@@ -1608,6 +1608,19 @@ fn autosave_loop(app: AppHandle) {
             (p.revision, p.frames.clone())
         };
         let enabled = state.settings.lock().auto_recovery;
+        // 켤 때 복구 목록으로 옮기지 못한 지난 작업이 아직 여기 있으면(디스크 가득 참 등) 다시 옮겨 보고,
+        // 그래도 안 되면 건드리지 않는다. 그냥 두면 여기서 지우거나 덮어써서 복구할 작업이 사라졌다.
+        if recovery::holds_leftover(&dir) {
+            recovery::adopt_leftover(&recovery::root());
+        }
+        if recovery::holds_leftover(&dir) {
+            if !warned {
+                warned = true;
+                let msg = "지난번에 남은 작업을 복구 목록으로 옮기지 못해 작업 자동 저장을 멈췄습니다 (디스크 공간을 확인해 주세요)";
+                let _ = app.emit("notice", msg.to_string());
+            }
+            continue;
+        }
         if frames.is_empty() || !enabled {
             recovery::clear(&dir);
         } else if !recovery::room_for(&dir, &frames, AUTOSAVE_MIN_FREE) {
@@ -1679,7 +1692,14 @@ async fn recovery_open(app: AppHandle, id: String) -> CmdResult<ProjectView> {
             return Ok(v); // 프로그램을 끝내는 중
         }
         let frames = state.project.lock().frames.clone();
+        if frames.is_empty() {
+            // 그사이 녹화 틀로 돌아가 편집 내용이 비었다: 복구할 작업을 지우지 않고 목록에 남겨 둔다
+            return Ok(v);
+        }
         let cur = recovery::current(&root);
+        if recovery::holds_leftover(&cur) {
+            return Ok(v);
+        }
         if !state.settings.lock().auto_recovery
             || (recovery::room_for(&cur, &frames, AUTOSAVE_MIN_FREE)
                 && recovery::save(&cur, &frames, &state.recovery_stop).is_ok())
