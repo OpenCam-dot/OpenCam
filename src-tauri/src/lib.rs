@@ -1971,13 +1971,23 @@ enum OverlayKind {
     Insert,
 }
 
+/// 덧씌우기 본문을 정보(JSON 글)와 픽셀로 나눈다. 본문은 [정보 길이 4바이트][정보][픽셀] 순서다.
+/// 정보를 요청 머리말(헤더)에 넣으면, 적용할 프레임이 수천 장이거나 레이어가 많을 때 머리말 크기 한도를 넘는다.
+fn split_overlay_body(body: &[u8]) -> CmdResult<(&str, &[u8])> {
+    let bad = || "덧씌우기 정보가 없습니다".to_string();
+    let len = u32::from_le_bytes(body.get(..4).ok_or_else(bad)?.try_into().map_err(|_| bad())?) as usize;
+    let end = 4usize.checked_add(len).filter(|&e| e <= body.len()).ok_or_else(bad)?;
+    let raw = std::str::from_utf8(&body[4..end]).map_err(|_| bad())?;
+    Ok((raw, &body[end..]))
+}
+
 /// 그리기·텍스트·이미지 덧씌우기. 큰 픽셀 데이터를 JSON 없이 그대로 받는다.
 #[tauri::command]
 async fn apply_overlay(app: AppHandle, request: tauri::ipc::Request<'_>) -> CmdResult<ProjectView> {
-    let tauri::ipc::InvokeBody::Raw(rgba) = request.body() else {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
         return Err("그림 데이터가 없습니다".into());
     };
-    let raw = request.headers().get("x-overlay").and_then(|v| v.to_str().ok()).ok_or("덧씌우기 정보가 없습니다")?;
+    let (raw, rgba) = split_overlay_body(body)?;
     // 하나면 객체, 여러 개(레이어)면 배열. 픽셀은 순서대로 이어 붙어 온다.
     let metas: Vec<OverlayMeta> = match serde_json::from_str::<Vec<OverlayMeta>>(raw) {
         Ok(v) => v,

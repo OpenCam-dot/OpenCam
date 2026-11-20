@@ -1057,11 +1057,39 @@ fn quantize_shared(frames: &[Frame], quality: u8) -> Result<(Vec<u8>, Vec<u8>, V
         .par_iter()
         .map_init(|| res.clone(), |res, f| -> Result<_> { Ok(res.remapped(&mut to_img(f)?)?) })
         .collect::<Result<Vec<_>>>()?;
-    // 팔레트는 예전처럼 마지막 프레임 것을 쓴다
+    // 파일에는 팔레트가 하나만 들어간다. 그런데 색 번호를 매길 때마다 팔레트가 조금씩 다듬어져
+    // 프레임마다 팔레트가 다를 수 있다. 마지막 프레임 것을 쓰되, 팔레트가 다른 프레임은
+    // 그 프레임의 색 번호를 파일의 팔레트에서 가장 가까운 색의 번호로 바꿔 준다.
+    // (예전에는 번호를 그대로 써서 앞 프레임의 색이 조금 어긋났다.)
     let palette = mapped.last().map(|(pal, _)| pal.clone()).unwrap_or_default();
     let rgb = palette.iter().flat_map(|c| [c.r, c.g, c.b]).collect();
     let trns = palette.iter().map(|c| c.a).collect();
-    Ok((rgb, trns, mapped.into_iter().map(|(_, idx)| idx).collect()))
+    let indices = mapped
+        .into_par_iter()
+        .map(|(pal, mut idx)| {
+            if pal != palette {
+                let table = palette_map(&pal, &palette);
+                for i in idx.iter_mut() {
+                    *i = table[*i as usize];
+                }
+            }
+            idx
+        })
+        .collect();
+    Ok((rgb, trns, indices))
+}
+
+/// from 팔레트의 색 번호를 to 팔레트에서 가장 가까운 색의 번호로 바꾸는 표
+fn palette_map(from: &[imagequant::RGBA], to: &[imagequant::RGBA]) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    for (i, c) in from.iter().enumerate().take(256) {
+        let dist = |t: &imagequant::RGBA| {
+            let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
+            d(c.r, t.r) + d(c.g, t.g) + d(c.b, t.b) + d(c.a, t.a) * 2
+        };
+        table[i] = to.iter().enumerate().min_by_key(|(_, t)| dist(t)).map_or(0, |(k, _)| k as u8);
+    }
+    table
 }
 
 /// APNG 프레임 시간은 "분자/분모 초"이고 둘 다 u16이다.
@@ -1877,6 +1905,16 @@ mod tests {
         // 저장하는 동안 쓰는 임시 파일은 남지 않는다
         assert!(!saving_path(&path).exists());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn palette_numbers_are_moved_to_the_nearest_color() {
+        let c = |r, g, b| imagequant::RGBA::new(r, g, b, 255);
+        // 같은 색들이 순서만 다르고 조금 다듬어진 두 팔레트
+        let from = [c(250, 0, 0), c(0, 0, 250), c(10, 240, 10)];
+        let to = [c(0, 0, 255), c(0, 255, 0), c(255, 0, 0)];
+        let table = palette_map(&from, &to);
+        assert_eq!(&table[..3], &[2, 0, 1]);
     }
 
     #[test]

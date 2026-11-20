@@ -334,7 +334,7 @@ export function ManageDialog({
   };
 
   return (
-    <Modal title="파일 관리" onClose={onClose} wide>
+    <Modal title="파일 관리" onClose={onClose} onOk={onClose} okText="닫기" hideCancel wide>
       <p className="hint">
         저장 폴더: {settings.outputDir} · {files.length}개
       </p>
