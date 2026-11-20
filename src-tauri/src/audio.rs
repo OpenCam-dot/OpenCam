@@ -475,8 +475,6 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
         let mut timeline = Timeline::default();
         let mut converted: Vec<u8> = vec![];
         let mut checked = Instant::now();
-        // 새 장치의 소리 빠르기가 달라 이어 받을 수 없게 됨
-        let mut gave_up = false;
         let mut write_failed = false;
 
         loop {
@@ -513,7 +511,7 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
             if stopping {
                 break;
             }
-            if !gave_up && checked.elapsed() >= Duration::from_secs(1) {
+            if checked.elapsed() >= Duration::from_secs(1) {
                 checked = Instant::now();
                 let changed = match &session {
                     None => true,
@@ -522,10 +520,9 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
                 if changed {
                     match open(&en) {
                         Ok(new) if new.fmt.rate == rate => session = Some(new),
-                        Ok(_) => {
-                            session = None;
-                            gave_up = true;
-                        }
+                        // 새 장치는 소리 빠르기가 달라 이어 받을 수 없다. 그만두지 않고 계속 살핀다:
+                        // 이어폰을 잠깐 뺐다 꽂거나 원래 장치로 돌아오면 다시 받는다.
+                        Ok(_) => session = None,
                         // 지금은 장치가 없다. 조금 뒤에 다시 찾는다.
                         Err(_) => session = None,
                     }

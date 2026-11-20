@@ -1341,6 +1341,8 @@ pub struct Mp4Stream {
     child: std::process::Child,
     tx: Option<std::sync::mpsc::SyncSender<(std::sync::Arc<Vec<u8>>, u32)>>,
     writer: Option<std::thread::JoinHandle<()>>,
+    /// ffmpeg가 더 받지 못하게 됐다 (디스크가 가득 참, ffmpeg가 꺼짐 등)
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Mp4Stream {
@@ -1366,17 +1368,25 @@ impl Mp4Stream {
         let mut stdin = BufWriter::new(child.stdin.take().unwrap());
         // 녹화가 잠깐 밀려도 버틸 만큼만 쌓아 둔다 (너무 밀리면 녹화가 기다린다)
         let (tx, rx) = std::sync::mpsc::sync_channel::<(std::sync::Arc<Vec<u8>>, u32)>(8);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = failed.clone();
         let writer = std::thread::spawn(move || {
             for (px, copies) in rx {
                 for _ in 0..copies {
                     if stdin.write_all(&px).is_err() {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         return;
                     }
                 }
             }
             let _ = stdin.flush();
         });
-        Ok(Mp4Stream { path: path.to_path_buf(), child, tx: Some(tx), writer: Some(writer) })
+        Ok(Mp4Stream { path: path.to_path_buf(), child, tx: Some(tx), writer: Some(writer), failed })
+    }
+
+    /// 더 저장할 수 없게 됐나 (디스크가 가득 참 등). 녹화하는 쪽이 보고 녹화를 멈춘다.
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 같은 화면을 copies장 넣는다 (화면이 안 바뀐 시간만큼)

@@ -271,8 +271,21 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
             recorded += dt;
         }
         if let Some(d) = &direct {
+            if d.failed() {
+                stop_reason = Some("MP4를 더 저장할 수 없어 녹화를 멈췄습니다 (디스크 공간을 확인해 주세요)".into());
+                break;
+            }
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64 + 1;
-            d.push(px.clone(), target.saturating_sub(written) as u32);
+            let copies = target.saturating_sub(written) as u32;
+            // 캡처가 밀려 여러 칸을 한꺼번에 채울 때, 지난 칸들은 그때 보이던 앞 화면으로 채우고 지금 화면은 한 칸만 넣는다.
+            // 모두 지금 화면으로 채우면 화면이 실제보다 일찍 바뀐 것처럼 저장된다.
+            match &last_px {
+                Some(prev) if copies > 1 => {
+                    d.push(prev.clone(), copies - 1);
+                    d.push(px.clone(), 1);
+                }
+                _ => d.push(px.clone(), copies),
+            }
             written = written.max(target);
         }
         let same = opts.skip_same_frame && last_px.as_ref().is_some_and(|l| **l == *px);
@@ -308,6 +321,10 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         report(&s, &on_status, &mut last_report, false, recorded, bytes);
     }
 
+    // 소리에게 녹화 시간이 여기서 멈췄다고 알린다
+    if let (Some(a), Some(_)) = (&audio, last_tick) {
+        a.mark(audio::now(), false);
+    }
     // 마지막 프레임: 멈춘 시점까지 보인 시간, 최소 한 칸
     if let Some(t) = last_tick {
         let dt = t.elapsed();
