@@ -1411,7 +1411,9 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
     }
     let new = old.with_file_name(name);
     // Windows는 대소문자를 가리지 않아 a.gif → A.gif는 "이미 있는 파일"로 보인다. 같은 파일이면 그대로 바꾼다.
-    let same_file = new.to_string_lossy().to_lowercase() == old.to_string_lossy().to_lowercase();
+    // (폴더는 같으므로 파일 이름만 견준다. 경로 전체를 글자로 견주면 / 와 \ 가 섞였을 때 다르게 보인다.)
+    let lower = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    let same_file = lower(&new) == lower(&old);
     if !same_file && new.exists() {
         return Err("같은 이름의 파일이 이미 있습니다".into());
     }

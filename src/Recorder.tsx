@@ -115,11 +115,16 @@ export default function Recorder() {
     window.setTimeout(() => setNotice((cur) => (cur === m ? null : cur)), Math.max(5000, m.length * 90));
   }, []);
 
+  const relayoutRun = useRef(0);
   // 창 크기에서 구멍 위치를 계산해 Rust에 알린다.
   // toolbarBottom: 툴바 위치 설정을 막 바꿔 아직 화면에 반영되지 않았을 때 직접 넘긴다.
   const relayout = useCallback(async (toolbarBottom = bottom) => {
+    // 창 크기를 빠르게 여러 번 바꾸면 배치 계산이 겹친다. 늦게 끝난 옛 계산이 새 배치를 덮어쓰지 않게,
+    // 기다리는 사이에 더 새 계산이 시작됐으면 그만둔다.
+    const run = ++relayoutRun.current;
     const dpr = await win.scaleFactor();
     const size = await win.innerSize();
+    if (run !== relayoutRun.current) return;
     const b = Math.round(BORDER * dpr);
     const t = Math.round(TOOLBAR * dpr);
     if (fullRef.current) {
@@ -252,9 +257,15 @@ export default function Recorder() {
   const setHolePos = useCallback(
     async (x: number, y: number) => {
       if (!layout) return;
-      await win.setPosition(new PhysicalPosition(Math.round(x - layout.hole.x), Math.round(y - layout.hole.y)));
+      // 이 함수는 늘 setHoleSize 뒤에 부른다. 그때 창은 보통 배치(툴바 + 틀)로 돌아와 있으므로 구멍 자리는
+      // 테두리와 툴바 높이로 정해진다. 화면에 남아 있는 예전 배치(전체 화면·툴바 떼어 둠)의 구멍 자리를 쓰면
+      // 틀이 수백 픽셀 엉뚱한 곳으로 갔다.
+      const dpr = await win.scaleFactor();
+      const b = Math.round(BORDER * dpr);
+      const t = Math.round(TOOLBAR * dpr);
+      await win.setPosition(new PhysicalPosition(Math.round(x - b), Math.round(y - (bottom ? b : t + b))));
     },
-    [layout],
+    [layout, bottom],
   );
 
   const saveSettings = useCallback(
@@ -577,11 +588,13 @@ export default function Recorder() {
   const state = recording ? (status?.paused ? "paused" : "recording") : "idle";
   // 툴바 너비에 따라 단계적으로 줄인다. (기준은 각 단계 버튼들이 다 들어가는 너비)
   //  1080 이상: 모두 / 760 이상: 열기, 설정은 ☰ 메뉴로 (MP4 저장·녹음·커서 스위치는 남는 자리만큼 보인다)
-  //  560 이상: 단축키 글자를 빼고 영역은 아이콘만 / 그보다 좁으면: 영역·FPS 모두 아이콘 버튼
+  //  640 이상: 단축키 글자를 빼고 영역은 아이콘만 / 그보다 좁으면: 영역·FPS 모두 아이콘 버튼
+  //  (이 경계가 560이었을 때는 560~620에서 영역·FPS 칸이 넓어지며 MP4 저장 스위치가 밀려나 안 보였다.
+  //   더 좁은 540에서는 보이는데 넓히면 사라졌다. 스위치가 다시 들어가는 640부터 넓은 칸을 쓴다.)
   const barW = css(layout.bar.w);
   const wide = barW >= 1080;
   const withHotkey = barW >= 760;
-  const small = barW >= 560;
+  const small = barW >= 640;
   // 되돌리기 단추 글자는 조금 더 좁을 때까지 보여 준다 (작게 드래그한 영역에서도 알아보게)
   const restoreText = barW >= 480;
   const captureSize = fullMonitor ?? hole;

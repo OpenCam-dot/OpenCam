@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "selector",
+  "description": "Capability for the area selection overlay: it only reports the chosen area, so it gets no window control or opener permissions",
+  "windows": ["selector"],
+  "permissions": ["core:default"]
+}
