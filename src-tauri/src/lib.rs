@@ -276,6 +276,9 @@ fn virtual_desktop() -> CmdResult<Rect> {
 fn begin_area_selection(app: AppHandle, window: WebviewWindow, state: State<AppState>) -> CmdResult<()> {
     if window.label() != "recorder" { return Err("녹화 창에서만 영역을 선택할 수 있습니다".into()); }
     if state.recorder.lock().is_some() { return Err("녹화 중에는 영역을 선택할 수 없습니다".into()); }
+    // 녹화를 마무리하는 동안(MP4 마무리 1~3초)에도 막는다. 이때 선택 창을 띄우면 곧 편집 창이 뜨면서
+    // 화면 전체를 덮는 투명한 선택 창이 남을 수 있다.
+    if state.finishing.load(Ordering::SeqCst) { return Err("녹화를 마무리하는 중입니다. 잠시 뒤에 다시 해 주세요".into()); }
     let r = virtual_desktop()?;
     let selector = app.get_webview_window("selector").ok_or("영역 선택 창이 없습니다")?;
     let recorder = recorder_window(&app)?;

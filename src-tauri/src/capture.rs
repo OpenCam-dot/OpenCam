@@ -45,6 +45,8 @@ struct Output {
     staging: Option<ID3D11Texture2D>,
     staging_desc: Option<(u32, u32, DXGI_FORMAT)>,
     got_first: bool,
+    /// 녹화 영역이 옮겨져서, 받아 둔 화면에서 새 자리를 다시 떠 와야 한다
+    stale: bool,
     /// 모니터가 돌아간 정도 (90° 단위, 0~3). 돌린 모니터의 화면 이미지는 회전 전 방향으로 온다.
     quarter: u8,
 }
@@ -63,7 +65,12 @@ pub struct Capturer {
     outputs: Vec<Output>,
     /// 녹화 영역 크기의 BGRA 캔버스. 바뀐 모니터 부분만 덮어쓴다.
     canvas: Vec<u8>,
+    /// 화면 연결을 잃고(해상도 변경, 관리자 권한 창 등) 아직 다시 잡지 못한 때부터의 시각
+    lost_since: Option<std::time::Instant>,
 }
+
+/// 화면 연결을 잃은 뒤 이만큼 다시 잡아 보고, 그래도 안 되면 녹화를 멈춘다
+const RECONNECT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 모든 모니터의 (위치, 크기) 목록
 pub fn monitors() -> Result<Vec<Rect>> {
@@ -132,6 +139,7 @@ impl Capturer {
                         staging: None,
                         staging_desc: None,
                         got_first: false,
+                        stale: false,
                         quarter: 0,
                     };
                     o.open()?;
@@ -142,7 +150,7 @@ impl Capturer {
         if outputs.is_empty() {
             return Err(anyhow!("녹화 영역이 어떤 모니터와도 겹치지 않습니다"));
         }
-        Ok(Capturer { region, outputs, canvas: vec![0; (region.w * region.h * 4) as usize] })
+        Ok(Capturer { region, outputs, canvas: vec![0; (region.w * region.h * 4) as usize], lost_since: None })
     }
 
     pub fn region(&self) -> Rect {
@@ -161,8 +169,11 @@ impl Capturer {
             *self = Capturer::new(region)?;
         } else {
             self.region = region;
+            // 새 자리의 그림은 이미 받아 둔 화면에서 다시 떠 온다. 예전에는 새 화면이 올 때까지 기다리게 해서,
+            // 화면이 멈춰 있으면 틀을 옮길 때마다 1초씩 끊겼다. 모니터가 없는 자리에 옛 그림이 남지 않게 캔버스도 비운다.
+            self.canvas.fill(0);
             for o in &mut self.outputs {
-                o.got_first = false;
+                o.stale = true;
             }
         }
         Ok(())
@@ -170,11 +181,39 @@ impl Capturer {
 
     /// 현재 화면을 캔버스에 갱신하고 RGBA로 돌려준다.
     pub fn grab(&mut self, cursor: &CursorOptions) -> Result<Vec<u8>> {
+        // 화면 연결을 잃은 채 1초가 지나면 모니터 목록부터 새로 만든다 (해상도·회전이 바뀌면 옛 연결로는 다시 열리지 않는다)
+        if let Some(t) = self.lost_since
+            && t.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            match Capturer::new(self.region) {
+                Ok(mut fresh) => {
+                    // 새 화면이 오기 전까지는 마지막 그림을 그대로 보여 준다
+                    std::mem::swap(&mut fresh.canvas, &mut self.canvas);
+                    *self = fresh;
+                }
+                Err(e) if t.elapsed() >= RECONNECT_LIMIT => return Err(e.context("화면을 다시 잡지 못했습니다")),
+                Err(_) => {}
+            }
+        }
         let region = self.region;
+        let mut lost = false;
         for o in &mut self.outputs {
             let Some(part) = o.bounds.intersect(&region) else {
                 continue;
             };
+            // 연결을 잃었으면 다시 열어 본다. 아직 안 되면(관리자 권한 창이 떠 있는 동안 등) 이번에는 건너뛰고
+            // 다음에 다시 해 본다. 예전에는 한 번 실패하면 다음 캡처에서 녹화가 끝났다.
+            if o.dup.is_none() && o.open().is_err() {
+                lost = true;
+                continue;
+            }
+            // 영역이 옮겨졌으면 받아 둔 화면에서 새 자리를 떠 온다. 받아 둔 것이 없으면 새 화면을 기다린다.
+            if o.stale {
+                o.stale = false;
+                if !o.recopy(&region, &part, &mut self.canvas) {
+                    o.got_first = false;
+                }
+            }
             // 첫 화면은 반드시 받아야 한다. 새로 연 직후에는 이미지 없이(LastPresentTime 0) 오는 경우가 있어
             // 진짜 화면이 올 때까지 잠깐(최대 1초) 기다리고, 그래도 없으면 받은 그대로 쓴다.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -189,7 +228,7 @@ impl Capturer {
                         let code = e.downcast_ref::<windows::core::Error>().map(|e| e.code());
                         if code == Some(DXGI_ERROR_ACCESS_LOST) {
                             o.dup = None;
-                            let _ = o.open();
+                            lost |= o.open().is_err();
                             break;
                         } else if code != Some(DXGI_ERROR_WAIT_TIMEOUT) {
                             return Err(e);
@@ -201,6 +240,7 @@ impl Capturer {
                 }
             }
         }
+        self.lost_since = if lost { self.lost_since.or(Some(std::time::Instant::now())) } else { None };
         let mut bgra = self.canvas.clone();
         if cursor.draw || cursor.highlight || cursor.click_fx {
             draw_cursor(&mut bgra, region, cursor);
@@ -228,9 +268,58 @@ impl Output {
                 _ => 0,
             };
             self.dup = Some(dup);
+            // 해상도가 바뀌었으면 모니터 자리·크기도 달라졌다
+            if let Ok(d) = self.output.GetDesc() {
+                self.bounds = rect_of(&d.DesktopCoordinates);
+            }
         }
         self.got_first = false;
         Ok(())
+    }
+
+    /// 마지막으로 받아 둔 화면(staging)에서 part 부분을 캔버스로 다시 옮긴다. 받아 둔 화면이 없거나 실패하면 false.
+    fn recopy(&mut self, region: &Rect, part: &Rect, canvas: &mut [u8]) -> bool {
+        let (Some(staging), Some((w, h, format))) = (self.staging.as_ref(), self.staging_desc) else {
+            return false;
+        };
+        if !self.got_first {
+            return false;
+        }
+        unsafe { self.copy_staging(staging, (w, h, format), region, part, canvas).is_ok() }
+    }
+
+    /// staging 텍스처의 part 부분을 캔버스로 옮긴다
+    unsafe fn copy_staging(
+        &self,
+        staging: &ID3D11Texture2D,
+        (w, h, format): (u32, u32, DXGI_FORMAT),
+        region: &Rect,
+        part: &Rect,
+        canvas: &mut [u8],
+    ) -> Result<()> {
+        unsafe {
+            let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
+            if map.pData.is_null() {
+                self.context.Unmap(staging, 0);
+                return Err(anyhow!("화면 이미지를 읽을 수 없습니다"));
+            }
+            let hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            let bpp = if hdr { 8 } else { 4 };
+            let src = std::slice::from_raw_parts(map.pData as *const u8, (map.RowPitch * h) as usize);
+            let copied = copy_part(
+                &Texture { px: src, pitch: map.RowPitch as usize, w: w as usize, h: h as usize, bpp, hdr },
+                self.quarter,
+                (self.bounds.w as usize, self.bounds.h as usize),
+                ((part.x - self.bounds.x) as usize, (part.y - self.bounds.y) as usize),
+                (part.w as usize, part.h as usize),
+                canvas,
+                region.w as usize,
+                ((part.x - region.x) as usize, (part.y - region.y) as usize),
+            );
+            self.context.Unmap(staging, 0);
+            copied
+        }
     }
 
     /// 새 화면을 받아 캔버스에 옮긴다. 화면 이미지를 실제로 옮겼으면 true.
@@ -270,23 +359,7 @@ impl Output {
                 }
                 let staging = self.staging.as_ref().unwrap();
                 self.context.CopyResource(staging, &tex);
-                let mut map = D3D11_MAPPED_SUBRESOURCE::default();
-                self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut map))?;
-                let hdr = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-                let bpp = if hdr { 8 } else { 4 };
-                let src = std::slice::from_raw_parts(map.pData as *const u8, (map.RowPitch * desc.Height) as usize);
-                let copied = copy_part(
-                    &Texture { px: src, pitch: map.RowPitch as usize, w: desc.Width as usize, h: desc.Height as usize, bpp, hdr },
-                    self.quarter,
-                    (self.bounds.w as usize, self.bounds.h as usize),
-                    ((part.x - self.bounds.x) as usize, (part.y - self.bounds.y) as usize),
-                    (part.w as usize, part.h as usize),
-                    canvas,
-                    region.w as usize,
-                    ((part.x - region.x) as usize, (part.y - region.y) as usize),
-                );
-                self.context.Unmap(staging, 0);
-                copied.map(|()| true)
+                self.copy_staging(staging, key, region, part, canvas).map(|()| true)
             })();
             let _ = dup.ReleaseFrame();
             result
@@ -460,6 +533,13 @@ fn draw_cursor(canvas: &mut [u8], region: Rect, opt: &CursorOptions) {
             ReleaseDC(None, screen);
             return;
         };
+        // 버퍼를 못 받았으면(메모리 부족 등) 그리지 않는다. 빈 주소로 픽셀을 읽으면 프로그램이 꺼진다.
+        if bits.is_null() {
+            let _ = DeleteObject(dib.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            return;
+        }
         let old = SelectObject(mem, dib.into());
         let tile = std::slice::from_raw_parts_mut(bits as *mut u8, (S * S * 4) as usize);
         let copy = |tile: &mut [u8], canvas: &mut [u8], to_tile: bool| {

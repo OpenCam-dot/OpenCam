@@ -423,9 +423,11 @@ unsafe fn drain(s: &Session, mut f: impl FnMut(i64, &[u8], bool)) -> windows::co
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
             // 시각이 없거나 지금과 동떨어져 있으면 지금 시각에서 이 묶음 길이만큼 앞으로 본다
             let t = now();
-            let length = frames as i64 * TICKS / s.fmt.rate as i64;
-            let at = stamp as i64;
-            let unsure = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 || (t - at).abs() > 5 * TICKS;
+            let length = frames as i64 * TICKS / (s.fmt.rate as i64).max(1);
+            // 일부 가상 소리 장치는 엉뚱하게 큰 시각을 준다. i64로 못 옮기거나 지금과 동떨어지면 믿지 않는다
+            // (그냥 빼면 넘쳐서 프로그램이 꺼질 수 있다).
+            let at = i64::try_from(stamp).unwrap_or(i64::MAX);
+            let unsure = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 || t.abs_diff(at) > 5 * TICKS as u64;
             let bytes: &[u8] =
                 if silent { &[] } else { std::slice::from_raw_parts(data, frames as usize * s.fmt.block()) };
             f(if unsure { t - length } else { at }, bytes, silent);
