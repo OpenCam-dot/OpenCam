@@ -713,6 +713,12 @@ export default function Recorder() {
         className={`rec-toolbar ${mode === "normal" ? (bottom ? "bottom" : "") : mode === "full" ? "float top" : "float"}`}
         style={barStyle}
         data-tauri-drag-region={drag}
+        onChange={(e) => {
+            // 전체 화면: 스위치·목록을 쓰고 나면 포커스를 놓아 준다. 포커스가 남으면 "쓰는 중"으로 보여
+            // 툴바가 다시 숨지 않고 화면 위를 계속 가렸다.
+            const t = e.target as HTMLInputElement;
+            if (mode === "full" && (t.tagName === "SELECT" || t.type === "checkbox")) t.blur();
+        }}
         onMouseDownCapture={(e) => {
           if (e.button !== 0 || mode !== "normal" || !(e.target as HTMLElement).hasAttribute("data-tauri-drag-region")) return;
           setChanged(null);

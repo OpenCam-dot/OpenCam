@@ -2443,6 +2443,12 @@ mod tests {
         let p = dir.join("t.avif");
         export(&fr, &p, &opts(Format::Avif), &s, &|_, _| {}).unwrap();
         assert!(std::fs::metadata(&p).unwrap().len() > 0);
+        // 저장한 AVIF를 다시 열 수 있다 (대표 그림 한 장이 아니라 움직이는 영상 4장)
+        let path = p.to_string_lossy();
+        let info = crate::import::probe_video(&path).unwrap();
+        assert_eq!((info.width, info.height, info.fps.round() as u32), (16, 8, 10));
+        let back = crate::import::load_video(&path, 0, info.duration_ms, 10.0, 16, 8, usize::MAX, &|_, _| {}).unwrap();
+        assert_eq!(back.frames.len(), 4);
         // 바로 저장: 3장을 넣으면(앞 장은 2번) 4프레임짜리 MP4
         let m = Mp4Stream::start(&dir.join("d.mp4"), 16, 8, 10, 90, true).unwrap();
         m.push(std::sync::Arc::new(fr[0].rgba()), 2);

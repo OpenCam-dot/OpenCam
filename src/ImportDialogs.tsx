@@ -53,7 +53,8 @@ export function VideoImportDialog({
   const [start, setStart] = useState(0);
   // 긴 동영상을 통째로 불러오면 메모리가 모자라기 쉬워 처음 15초만 골라 둔다
   const [end, setEnd] = useState(Math.min(dur, 15000));
-  const [fps, setFps] = useState(Math.min(defaultFps, Math.round(info.fps)) || 15);
+  // 불러오기는 60 FPS까지 (기본 FPS 설정이 그보다 높아도 버튼이 잠기지 않게)
+  const [fps, setFps] = useState(Math.max(1, Math.min(defaultFps, Math.round(info.fps), 60)) || 15);
   const [pct, setPct] = useState(info.width > 1280 ? Math.floor((1280 / info.width) * 100) : 100);
   const w = Math.max(1, Math.round((info.width * pct) / 100));
   const h = Math.max(1, Math.round((info.height * pct) / 100));
@@ -88,10 +89,10 @@ export function VideoImportDialog({
           value={start}
           onChange={(e) => {
             const v = Number(e.target.value);
-            setStart(Math.min(v, end - 100));
+            setStart(Math.max(0, Math.min(v, end - 100)));
           }}
         />
-        <NumField label="" value={sec(start)} min={0} suffix="초" onChange={(v) => v >= 0 && setStart(Math.min(v * 1000, end - 100))} />
+        <NumField label="" value={sec(start)} min={0} suffix="초" onChange={(v) => v >= 0 && setStart(Math.max(0, Math.min(v * 1000, end - 100)))} />
       </label>
       <label className="field">
         <span>끝</span>
@@ -103,7 +104,7 @@ export function VideoImportDialog({
           value={end}
           onChange={(e) => {
             const v = Number(e.target.value);
-            setEnd(Math.max(v, start + 100));
+            setEnd(Math.min(dur, Math.max(v, start + 100)));
           }}
         />
         <NumField label="" value={sec(end)} min={0} suffix="초" onChange={(v) => v > 0 && setEnd(Math.min(dur, Math.max(v * 1000, start + 100)))} />

@@ -133,6 +133,25 @@ export function Field({ label, sub, children }: { label: ReactNode; sub?: boolea
   );
 }
 
+/** 숫자칸에 치는 중인 글자. 치는 동안에는 친 그대로 보여 주고, 칸을 떠나면 실제 값으로 돌아간다.
+ *  값을 바로 최소·최대에 맞춰 되돌려 주면 "20"을 치려고 "2"를 누른 순간 "5"로 바뀌어 "50"이 됐다. */
+export function useNumDraft(value: number, onChange: (v: number) => void, step?: number) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const whole = Number.isInteger(step ?? 1);
+  return {
+    value: draft ?? (Number.isFinite(value) ? String(value) : ""),
+    onChange: (e: { target: { value: string } }) => {
+      const t = e.target.value;
+      setDraft(t);
+      const v = t === "" ? NaN : Number(t);
+      // 정수만 받는 칸에 소수를 치면 반올림해 넘긴다 (Rust 쪽은 정수만 받는다)
+      onChange(whole && Number.isFinite(v) ? Math.round(v) : v);
+    },
+    onFocus: (e: { target: { value: string } }) => setDraft(e.target.value),
+    onBlur: () => setDraft(null),
+  };
+}
+
 /** 단위가 칸 안에 붙은 숫자 입력. 비우면 NaN을 넘긴다(받는 쪽에서 거른다). */
 export function NumInput({
   value,
@@ -160,18 +179,10 @@ export function NumInput({
   wide?: boolean;
   narrow?: boolean;
 }) {
+  const draft = useNumDraft(value, onChange, step);
   return (
     <span className={`pnum ${disabled ? "dis" : ""} ${wide ? "wide" : ""} ${narrow ? "narrow" : ""}`} title={title}>
-      <input
-        type="number"
-        aria-label={label}
-        value={Number.isFinite(value) ? value : ""}
-        min={min}
-        max={max}
-        step={step}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value === "" ? NaN : Number(e.target.value))}
-      />
+      <input type="number" aria-label={label} min={min} max={max} step={step} disabled={disabled} {...draft} />
       {unit && <em>{unit}</em>}
     </span>
   );

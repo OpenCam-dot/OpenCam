@@ -564,11 +564,12 @@ impl Overlay {
                 }
             }
         };
-        if self.anim_in != Anim::None && self.in_ms > 0.0 {
-            phase(self.anim_in, tm / self.in_ms);
+        let (in_ms, out_ms) = fit_anim_times(self.anim_in, self.in_ms, self.anim_out, self.out_ms, total);
+        if in_ms > 0.0 {
+            phase(self.anim_in, tm / in_ms);
         }
-        if self.anim_out != Anim::None && self.out_ms > 0.0 {
-            phase(self.anim_out, (total - tm) / self.out_ms);
+        if out_ms > 0.0 {
+            phase(self.anim_out, (total - tm) / out_ms);
         }
         if alpha <= 0.0 || scale <= 0.01 {
             return;
@@ -576,6 +577,20 @@ impl Overlay {
         let cx = self.x + self.w as f32 / 2.0 + dx;
         let cy = self.y + self.h as f32 / 2.0 + dy;
         composite_rotated(px, fw, fh, &self.rgba, self.w, self.h, cx, cy, scale, angle, alpha);
+    }
+}
+
+/// 등장·퇴장 시간을 구간 길이(total)에 맞춘다: 둘을 더한 것이 구간보다 길면 같은 비율로 줄인다.
+/// 줄이지 않으면 짧은 구간(프레임 한 장 등)에서는 등장이 끝나기도 전에 퇴장이 시작돼,
+/// 기본값(페이드 300ms씩)으로 한 장에 넣은 글자·그림이 거의 안 보였다. 효과가 없으면 0.
+fn fit_anim_times(anim_in: Anim, in_ms: f32, anim_out: Anim, out_ms: f32, total: f32) -> (f32, f32) {
+    let a = if anim_in != Anim::None { in_ms.max(0.0) } else { 0.0 };
+    let b = if anim_out != Anim::None { out_ms.max(0.0) } else { 0.0 };
+    if a + b > total && a + b > 0.0 {
+        let k = total.max(0.0) / (a + b);
+        (a * k, b * k)
+    } else {
+        (a, b)
     }
 }
 
@@ -848,6 +863,17 @@ mod tests {
         let mut p = img(1, 1, [0, 0, 0, 255]);
         apply_transition(&mut p, TransitionKind::FadeInWhite, 600.0, 1000.0, 500.0, &first);
         assert_eq!(p[0], 0);
+    }
+
+    #[test]
+    fn overlay_animation_fits_into_a_short_span() {
+        // 프레임 한 장(100ms)에 페이드 300ms씩: 가운데 시각(50ms)에서 다 보여야 한다
+        let (a, b) = fit_anim_times(Anim::Fade, 300.0, Anim::Fade, 300.0, 100.0);
+        assert_eq!((a, b), (50.0, 50.0));
+        assert!(50.0 / a >= 1.0 && (100.0 - 50.0) / b >= 1.0);
+        // 넉넉한 구간에서는 그대로, 효과가 없으면 0
+        assert_eq!(fit_anim_times(Anim::Fade, 300.0, Anim::None, 300.0, 1000.0), (300.0, 0.0));
+        assert_eq!(fit_anim_times(Anim::Fade, 300.0, Anim::Fade, 100.0, 200.0), (150.0, 50.0));
     }
 
     #[test]

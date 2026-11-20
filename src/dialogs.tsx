@@ -12,7 +12,7 @@ import {
 } from "./api";
 
 import SidePanel from "./SidePanel";
-import { bandSelect, Field, FrameContext, NumInput, PanelFoot, Section, Segmented, Slider, TimelineContext, useBand, useReportDirty } from "./Panel";
+import { bandSelect, Field, FrameContext, NumInput, PanelFoot, Section, Segmented, Slider, TimelineContext, useBand, useNumDraft, useReportDirty } from "./Panel";
 import { bounds, framesBackMs, framesForMs, spanText } from "./timeline";
 
 /** true면 Modal을 창 가운데가 아니라 편집 창 오른쪽 패널에 그린다 (왼쪽 도구 목록에서 연 도구) */
@@ -84,7 +84,8 @@ export function Modal({
       if (e.key === "Escape") {
         if (!cancelOnly) onClose();
       }
-      else if (e.key === "Enter" && onOk && !blocked && (e.target as HTMLElement).tagName !== "TEXTAREA") {
+      else if (e.key === "Enter" && onOk && !blocked && !["TEXTAREA", "BUTTON", "SELECT", "A"].includes((e.target as HTMLElement).tagName)) {
+        // 버튼에 포커스가 있을 때의 Enter는 그 버튼을 누르는 것이다 ("취소"에서 Enter를 쳐도 적용되던 것을 막는다)
         e.preventDefault();
         onOk();
       }
@@ -150,17 +151,12 @@ export function NumField({
   suffix?: string;
   disabled?: boolean;
 }) {
+  // 이 칸은 초·FPS처럼 소수도 받는다 (반올림하지 않음)
+  const draft = useNumDraft(value, onChange, 0.001);
   return (
     <label className="field">
       <span>{label}</span>
-      <input
-        type="number"
-        value={Number.isFinite(value) ? value : ""}
-        min={min}
-        max={max}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value === "" ? NaN : Number(e.target.value))}
-      />
+      <input type="number" min={min} max={max} disabled={disabled} {...draft} />
       {suffix && <em>{suffix}</em>}
     </label>
   );

@@ -12,7 +12,8 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts"];
+// avif는 ffmpeg로 읽으므로 동영상 쪽에 둔다 (이 프로그램이 저장한 AVIF를 다시 열 수 있게)
+pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts", "avif"];
 pub const IMAGE_EXTS: &[&str] = &["gif", "webp", "png", "apng", "jpg", "jpeg", "bmp"];
 
 pub fn ext_of(path: &Path) -> String {
@@ -278,10 +279,29 @@ pub(crate) fn parse_ffmpeg_timestamp(text: &str) -> Option<u64> {
 }
 
 /// 길이를 모르면 내부에서는 None, 공개 정보에서는 0으로 나타낸다.
+/// 움직이는 AVIF에는 영상 줄기가 둘 있다: 대표 그림 한 장(0번)과 움직이는 영상(1번).
+/// ffmpeg는 그냥 두면 0번을 골라 한 장만 읽으므로, AVIF이고 줄기가 둘 이상이면 1번을 쓴다.
+/// 돌려주는 값은 영상 줄기들 가운데 몇 번째인지 (다른 파일은 늘 0).
+fn avif_stream(info: &str) -> usize {
+    // AVIF는 mov 계열로 읽혀서 형식 이름으로는 알 수 없다. "Input #0, …, from '파일.avif':" 줄의 파일 이름으로 본다.
+    let avif = info.lines().any(|l| l.starts_with("Input #0") && l.trim_end().to_lowercase().ends_with(".avif':"));
+    let videos = info.lines().filter(|l| l.contains("Stream") && l.contains("Video:")).count();
+    usize::from(avif && videos >= 2)
+}
+
+/// ffmpeg에 읽을 영상 줄기를 알려 주는 인수 (AVIF만 필요, 나머지는 비어 있음)
+fn stream_args(path: &str) -> Result<Vec<String>> {
+    if ext_of(Path::new(path)) != "avif" {
+        return Ok(vec![]);
+    }
+    let out = ffmpeg_command()?.args(["-hide_banner", "-i", path]).stdin(Stdio::null()).stdout(Stdio::null()).output()?;
+    Ok(vec!["-map".into(), format!("0:v:{}", avif_stream(&String::from_utf8_lossy(&out.stderr)))])
+}
+
 fn parse_ffmpeg_info_inner(text: &str) -> Option<(VideoInfo, Option<u64>)> {
     let duration =
         text.split("Duration: ").nth(1).and_then(|s| s.split(',').next()).and_then(parse_ffmpeg_timestamp);
-    let line = text.lines().find(|l| l.contains("Stream") && l.contains("Video:"))?;
+    let line = text.lines().filter(|l| l.contains("Stream") && l.contains("Video:")).nth(avif_stream(text))?;
     let (mut width, mut height, mut fps) = (0, 0, 30.0f32);
     for item in line.split(',') {
         let item = item.trim();
@@ -365,6 +385,7 @@ pub fn probe_video(path: &str) -> Result<VideoInfo> {
 pub fn video_frame_png(path: &str, at_ms: u64, max_w: u32) -> Result<Vec<u8>> {
     let out = ffmpeg_command()?
         .args(["-v", "error", "-ss", &format!("{:.3}", at_ms as f64 / 1000.0), "-i", path])
+        .args(stream_args(path)?)
         .args(["-frames:v", "1", "-vf", &format!("scale='min({max_w},iw)':-2"), "-f", "image2pipe", "-c:v", "png", "-"])
         .stdin(Stdio::null())
         .output()?;
@@ -524,6 +545,7 @@ fn load_video_inner(
     let mut child = ffmpeg_command()?
         .args(["-v", "error", "-ss", &format!("{:.3}", start_ms as f64 / 1000.0)])
         .args(["-t", &format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0), "-i", path])
+        .args(stream_args(path)?)
         .args(["-vf", &format!("fps={fps},trim=end_frame={expected:.0},scale={w}:{h}:flags=bicubic"), "-an"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdin(Stdio::null())
