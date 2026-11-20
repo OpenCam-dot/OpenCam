@@ -119,6 +119,8 @@ export default function Editor() {
   const [anchor, setAnchor] = useState(0);
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
+  /** 재생을 시작하며 앞의 몇 장을 이미 불러 두었나 */
+  const preloading = useRef(false);
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const [dialog, setDialog] = useState<Dialog>(null);
   const [mode, setModeRaw] = useState<Mode>(null);
@@ -142,10 +144,18 @@ export default function Editor() {
   const [stage, setStage] = useState({ w: 800, h: 500 });
   /** 오른쪽 패널 자리. 도구 화면이 설정 패널을 여기로 옮겨 그린다. */
   const [sideEl, setSideEl] = useState<HTMLElement | null>(null);
-  /** 열린 도구 패널에 아직 적용하지 않은 변경이 있나 (패널이 알려 준다) */
-  const toolDirty = useRef(false);
-  const reportDirty = useCallback((d: boolean) => {
-    toolDirty.current = d;
+  /** 열린 도구 패널 가운데 아직 적용하지 않은 변경이 있는 것들 (패널이 알려 준다) */
+  const toolDirty = useRef(new Set<object>());
+  const reportDirty = useCallback((who: object, d: boolean) => {
+    if (d) toolDirty.current.add(who);
+    else toolDirty.current.delete(who);
+  }, []);
+  /** 열린 도구에 적용하지 않은 변경이 있으면 버려도 되는지 묻는다 (새로 열기·녹화 틀로 가기·끝내기 전에) */
+  const discardToolChanges = useCallback(async () => {
+    if (toolDirty.current.size === 0) return true;
+    if (!(await confirmAsk("열린 도구에 적용하지 않은 변경이 있습니다. 버릴까요?", "버리기"))) return false;
+    toolDirty.current.clear();
+    return true;
   }, []);
 
   const frames = view.frames;
@@ -272,6 +282,7 @@ export default function Editor() {
   /** 편집 창을 닫고 녹화 틀로 (저장 안 한 내용이 있으면 묻는다) */
   const backToRecorder = useCallback(async () => {
     if (blockWhileAppending()) return;
+    if (!(await discardToolChanges())) return;
     if (
       askDiscard &&
       !(await confirmAsk("저장하지 않은 내용이 있습니다. 버리고 녹화 화면으로 돌아갈까요?", "버리고 돌아가기"))
@@ -291,6 +302,7 @@ export default function Editor() {
         returnToRecorderIfCancelled();
         return;
       }
+      if (!(await discardToolChanges())) return;
       if (
         askDiscard &&
         !(await confirmAsk("저장하지 않은 내용이 있습니다. 버리고 끝낼까요?", "버리고 끝내기"))
@@ -342,6 +354,7 @@ export default function Editor() {
         returnToRecorderIfCancelled();
         return;
       }
+      if (!(await discardToolChanges())) return;
       if (
         askDiscard &&
         !(await confirmAsk("저장하지 않은 내용이 있습니다. 버리고 새 파일을 열까요?", "버리고 열기"))
@@ -433,20 +446,34 @@ export default function Editor() {
 
   // 재생: 프레임마다 자기 시간만큼 보여준다
   useEffect(() => {
+    // 한 장뿐이면 재생할 것이 없다 (재생 단추가 "재생 중"으로 남지 않게 끈다)
+    if (playing && frames.length < 2) setPlaying(false);
     if (!playing || frames.length < 2) return;
     const f = frames[current];
-    // 다음 몇 장을 미리 불러 둔다
-    for (let k = 1; k <= 3; k++) new Image().src = frameUrl(frames[(current + k) % frames.length].id);
+    // 다음 몇 장을 미리 불러 둔다. 재생을 막 시작했을 때만 3장을 부르고, 그 뒤로는 새로 필요한 한 장(3장 뒤)만 부른다.
+    // 매번 3장씩 부르면 같은 그림을 세 번씩 요청했다.
+    const ahead = (k: number) => (new Image().src = frameUrl(frames[(current + k) % frames.length].id));
+    if (!preloading.current) {
+      preloading.current = true;
+      ahead(1);
+      ahead(2);
+    }
+    ahead(3);
     const t = window.setTimeout(() => setCurrent((c) => (c + 1) % frames.length), Math.max(10, f?.delayMs ?? 100));
     return () => window.clearTimeout(t);
   }, [playing, current, frames]);
+  useEffect(() => {
+    if (!playing) preloading.current = false;
+  }, [playing]);
 
   const selectFrame = useCallback(
     (i: number, e: { ctrlKey: boolean; shiftKey: boolean }) => {
       setPlaying(false);
       setCurrent(i);
       if (e.shiftKey) {
-        const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)];
+        // 프레임을 지워 수가 줄었으면 기준이 끝을 넘어가 있을 수 있다 (없는 프레임까지 고르지 않게)
+        const from = Math.max(0, Math.min(anchor, frames.length - 1));
+        const [a, b] = [Math.min(from, i), Math.max(from, i)];
         setSel(range(a, b));
       } else if (e.ctrlKey) {
         setSel((s) => (s.includes(i) ? s.filter((x) => x !== i) : [...s, i].sort((x, y) => x - y)));
@@ -456,7 +483,7 @@ export default function Editor() {
         setAnchor(i);
       }
     },
-    [anchor],
+    [anchor, frames.length],
   );
 
   /** 선택이 없으면 지금 보고 있는 프레임 */
@@ -503,10 +530,18 @@ export default function Editor() {
         }
         return;
       }
-      if (busy || dialog || menu || frames.length === 0 || isModalOpen()) return;
+      if (busy || dialog || menu || isModalOpen()) return;
       if (mode) return; // 도구 화면이 자기 단축키를 처리한다
       const k = e.key.toLowerCase();
       const ctrl = e.ctrlKey || e.metaKey;
+      // 아무것도 열지 않은 빈 화면에서는 열기(Ctrl+O)와 콜라주(G)만 된다
+      if (frames.length === 0) {
+        if (ctrl && k === "o") openPaths();
+        else if (!ctrl && !e.altKey && k === "g") openNewDialog("collage");
+        else return;
+        e.preventDefault();
+        return;
+      }
       let handled = true;
       if (k === " ") setPlaying((p) => !p);
       else if (k === "delete") run({ op: "delete", sel: target });
@@ -584,9 +619,9 @@ export default function Editor() {
 
   /** 열린 도구에 적용하지 않은 변경이 있으면 버려도 되는지 묻는다 */
   const leaveTool = async () => {
-    if (!toolDirty.current) return true;
+    if (toolDirty.current.size === 0) return true;
     if (!(await confirmAsk("적용하지 않은 변경이 있습니다. 버리고 다른 도구로 바꿀까요?", "버리고 바꾸기"))) return false;
-    toolDirty.current = false;
+    toolDirty.current.clear();
     return true;
   };
 
@@ -1120,6 +1155,8 @@ export default function Editor() {
           onClose={closeDialog}
           onEdit={(path) => {
             if (blockWhileAppending()) return;
+            // 다른 작업(저장·편집)이 도는 중에 새 파일을 열면 두 작업이 겹친다
+            if (busy) return showToast("하던 작업이 끝난 뒤에 다시 해 주세요");
             setDialog(null);
             openPaths([path]);
           }}

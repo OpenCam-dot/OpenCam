@@ -1,6 +1,6 @@
 import { sortByFileName } from "./fileOrder.ts";
 
-export const VIDEO_EXTS = ["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts"];
+export const VIDEO_EXTS = ["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts", "avif"];
 /** 움직이는 그림일 수 있는 확장자 (하나만 열면 옵션 없이 바로 불러온다) */
 const ANIMATED_EXTS = ["gif", "webp", "png", "apng"];
 

@@ -12,7 +12,8 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts"];
+// avif는 ffmpeg로 읽으므로 동영상 쪽에 둔다 (이 프로그램이 저장한 AVIF를 다시 열 수 있게)
+pub const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mkv", "mov", "avi", "wmv", "m4v", "flv", "mpg", "mpeg", "ts", "avif"];
 pub const IMAGE_EXTS: &[&str] = &["gif", "webp", "png", "apng", "jpg", "jpeg", "bmp"];
 
 pub fn ext_of(path: &Path) -> String {
@@ -255,6 +256,15 @@ pub struct VideoInfo {
     pub fps: f32,
 }
 
+/// ffmpeg에 넘길 입력 파일 경로를 확인한다: 전체 경로만 받는다.
+/// `-`로 시작하는 이름은 ffmpeg가 옵션으로 읽고, `http://…` 같은 주소는 인터넷에서 받아 오므로 막는다.
+fn local_input(path: &str) -> Result<&str> {
+    if !Path::new(path).is_absolute() {
+        bail!("파일의 전체 경로가 아니어서 열 수 없습니다");
+    }
+    Ok(path)
+}
+
 fn ffmpeg_command() -> Result<Command> {
     crate::export::ffmpeg().ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. 동영상을 열려면 ffmpeg가 필요합니다."))
 }
@@ -278,10 +288,29 @@ pub(crate) fn parse_ffmpeg_timestamp(text: &str) -> Option<u64> {
 }
 
 /// 길이를 모르면 내부에서는 None, 공개 정보에서는 0으로 나타낸다.
+/// 움직이는 AVIF에는 영상 줄기가 둘 있다: 대표 그림 한 장(0번)과 움직이는 영상(1번).
+/// ffmpeg는 그냥 두면 0번을 골라 한 장만 읽으므로, AVIF이고 줄기가 둘 이상이면 1번을 쓴다.
+/// 돌려주는 값은 영상 줄기들 가운데 몇 번째인지 (다른 파일은 늘 0).
+fn avif_stream(info: &str) -> usize {
+    // AVIF는 mov 계열로 읽혀서 형식 이름으로는 알 수 없다. "Input #0, …, from '파일.avif':" 줄의 파일 이름으로 본다.
+    let avif = info.lines().any(|l| l.starts_with("Input #0") && l.trim_end().to_lowercase().ends_with(".avif':"));
+    let videos = info.lines().filter(|l| l.contains("Stream") && l.contains("Video:")).count();
+    usize::from(avif && videos >= 2)
+}
+
+/// ffmpeg에 읽을 영상 줄기를 알려 주는 인수 (AVIF만 필요, 나머지는 비어 있음)
+fn stream_args(path: &str) -> Result<Vec<String>> {
+    if ext_of(Path::new(path)) != "avif" {
+        return Ok(vec![]);
+    }
+    let out = ffmpeg_command()?.args(["-hide_banner", "-i", path]).stdin(Stdio::null()).stdout(Stdio::null()).output()?;
+    Ok(vec!["-map".into(), format!("0:v:{}", avif_stream(&String::from_utf8_lossy(&out.stderr)))])
+}
+
 fn parse_ffmpeg_info_inner(text: &str) -> Option<(VideoInfo, Option<u64>)> {
     let duration =
         text.split("Duration: ").nth(1).and_then(|s| s.split(',').next()).and_then(parse_ffmpeg_timestamp);
-    let line = text.lines().find(|l| l.contains("Stream") && l.contains("Video:"))?;
+    let line = text.lines().filter(|l| l.contains("Stream") && l.contains("Video:")).nth(avif_stream(text))?;
     let (mut width, mut height, mut fps) = (0, 0, 30.0f32);
     for item in line.split(',') {
         let item = item.trim();
@@ -302,16 +331,60 @@ fn parse_ffmpeg_info_inner(text: &str) -> Option<(VideoInfo, Option<u64>)> {
         return None;
     }
     // 휴대폰 동영상은 돌려서 보여주라는 표시가 있다. ffmpeg는 자동으로 돌리므로 가로·세로를 바꿔 둔다.
-    let rotated = text.lines().any(|l| {
-        let l = l.trim();
-        (l.starts_with("rotate") && (l.contains("90") || l.contains("270")))
-            || (l.contains("rotation of") && (l.contains("90") || l.contains("270")))
-    });
-    if rotated {
+    if is_rotated_sideways(text) {
         std::mem::swap(&mut width, &mut height);
     }
     let fps = if fps.is_finite() { fps.clamp(1.0, 240.0) } else { 30.0 };
     Some((VideoInfo { width, height, duration_ms: duration.unwrap_or(0), fps }, duration))
+}
+
+/// 돌려서 보여주라는 표시가 90°나 270°인가. 표시는 두 가지 모양으로 온다:
+/// `rotate          : 90` 과 `displaymatrix: rotation of -90.00 degrees`.
+/// 숫자를 읽어서 판단한다. 글자가 들어 있는지만 보면 파일 이름("rotation of 90.mp4")이나
+/// `-0.90 degrees` 같은 값에도 걸려 가로·세로가 뒤바뀌었다.
+fn is_rotated_sideways(info: &str) -> bool {
+    let sideways = |deg: f64| {
+        let q = (deg.round() as i64).rem_euclid(360);
+        q == 90 || q == 270
+    };
+    info.lines().map(str::trim).filter(|l| !l.starts_with("Input #")).any(|l| {
+        if let Some(v) = l.strip_prefix("rotate").and_then(|r| r.trim_start().strip_prefix(':')) {
+            return v.trim().parse::<f64>().is_ok_and(sideways);
+        }
+        l.split("rotation of ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(sideways)
+    })
+}
+
+/// 길이 확인이 이보다 오래 걸리면 그만둔다 (아주 큰 파일을 끝까지 훑느라 창이 한없이 기다리지 않게)
+const SCAN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 명령을 돌려 stdout을 받는다. limit 안에 끝나지 않으면 끄고 None.
+fn output_within(mut cmd: Command, limit: std::time::Duration) -> Result<Option<(bool, String)>> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("ffmpeg 실행 실패")?;
+    let mut out = child.stdout.take().context("ffmpeg 출력을 읽을 수 없습니다")?;
+    // 출력은 다른 스레드에서 읽는다 (읽어 주지 않으면 출력이 많을 때 ffmpeg가 멈춘다)
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text);
+        text
+    });
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some((status.success(), reader.join().unwrap_or_default())));
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
 }
 
 /// 일반 진행 출력의 time=과 -progress의 out_time=을 모두 읽는다.
@@ -332,10 +405,12 @@ fn scan_video_duration(path: &str) -> Result<u64> {
         if copy {
             cmd.args(["-c:v", "copy"]);
         }
-        // output()으로 stdout과 stderr를 함께 읽고, 키보드 입력도 기다리지 않는다.
-        let out = cmd.args(["-f", "null", "-"]).stdin(Stdio::null()).output().context("ffmpeg 실행 실패")?;
-        if out.status.success()
-            && let Some(ms) = parse_ffmpeg_progress_time(&String::from_utf8_lossy(&out.stdout))
+        cmd.args(["-f", "null", "-"]);
+        let Some((ok, text)) = output_within(cmd, SCAN_LIMIT)? else {
+            bail!("동영상 길이를 확인하는 데 너무 오래 걸려 그만두었습니다. 다른 동영상 파일로 저장한 뒤 다시 열어 주세요.");
+        };
+        if ok
+            && let Some(ms) = parse_ffmpeg_progress_time(&text)
             && ms > 0
         {
             return Ok(ms);
@@ -345,6 +420,7 @@ fn scan_video_duration(path: &str) -> Result<u64> {
 }
 
 pub fn probe_video(path: &str) -> Result<VideoInfo> {
+    let path = local_input(path)?;
     let out = ffmpeg_command()?
         .args(["-hide_banner", "-i", path])
         .stdin(Stdio::null())
@@ -363,8 +439,10 @@ pub fn probe_video(path: &str) -> Result<VideoInfo> {
 
 /// 구간을 고를 때 보여줄 장면 하나 (가로 max_w 이하 PNG)
 pub fn video_frame_png(path: &str, at_ms: u64, max_w: u32) -> Result<Vec<u8>> {
+    let path = local_input(path)?;
     let out = ffmpeg_command()?
         .args(["-v", "error", "-ss", &format!("{:.3}", at_ms as f64 / 1000.0), "-i", path])
+        .args(stream_args(path)?)
         .args(["-frames:v", "1", "-vf", &format!("scale='min({max_w},iw)':-2"), "-f", "image2pipe", "-c:v", "png", "-"])
         .stdin(Stdio::null())
         .output()?;
@@ -513,6 +591,7 @@ fn load_video_inner(
     max_bytes: usize,
     progress: Progress,
 ) -> Result<Loaded> {
+    let path = local_input(path)?;
     if end_ms <= start_ms {
         bail!("구간이 비었습니다");
     }
@@ -524,6 +603,7 @@ fn load_video_inner(
     let mut child = ffmpeg_command()?
         .args(["-v", "error", "-ss", &format!("{:.3}", start_ms as f64 / 1000.0)])
         .args(["-t", &format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0), "-i", path])
+        .args(stream_args(path)?)
         .args(["-vf", &format!("fps={fps},trim=end_frame={expected:.0},scale={w}:{h}:flags=bicubic"), "-an"])
         .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdin(Stdio::null())
@@ -646,9 +726,27 @@ mod tests {
     }
 
     #[test]
+    fn rotation_is_read_from_the_number_not_from_any_text() {
+        let stream = "  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps\n";
+        let info = |extra: &str| format!("Input #0, mov, from 'a.mp4':\n  Duration: 00:00:01.00\n{stream}{extra}");
+        let size = |text: String| parse_ffmpeg_info(&text).map(|i| (i.width, i.height)).unwrap();
+        assert_eq!(size(info("")), (1920, 1080));
+        assert_eq!(size(info("    rotate          : 90\n")), (1080, 1920));
+        assert_eq!(size(info("      displaymatrix: rotation of -90.00 degrees\n")), (1080, 1920));
+        assert_eq!(size(info("      displaymatrix: rotation of 270.00 degrees\n")), (1080, 1920));
+        // 돌리지 않는 값들
+        assert_eq!(size(info("      displaymatrix: rotation of -0.90 degrees\n")), (1920, 1080));
+        assert_eq!(size(info("      displaymatrix: rotation of 180.00 degrees\n")), (1920, 1080));
+        assert_eq!(size(info("    rotate          : 0\n")), (1920, 1080));
+        // 파일 이름에 같은 글자가 있어도 걸리지 않는다
+        let named = format!("Input #0, mov, from 'rotation of 90.mp4':\n  Duration: 00:00:01.00\n{stream}");
+        assert_eq!(size(named), (1920, 1080));
+    }
+
+    #[test]
     fn huge_video_is_rejected_without_ffmpeg() {
         for (w, h) in [(32768, 32768), (65535, 65535), (u32::MAX, u32::MAX)] {
-            let err = load_video("없는_파일.mp4", 0, 1000, 30.0, w, h, usize::MAX, &|_, _| {})
+            let err = load_video("C:/없는_파일.mp4", 0, 1000, 30.0, w, h, usize::MAX, &|_, _| {})
                 .err()
                 .expect("너무 큰 동영상은 거부해야 합니다");
             assert!(err.to_string().contains("동영상 크기가 너무 커서 불러올 수 없습니다"), "{err}");

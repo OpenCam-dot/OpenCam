@@ -162,6 +162,14 @@ impl Screen for Capturer {
     }
 }
 
+/// 옮겨 갈 영역 to의 크기를 지금 영역 now의 크기로 맞춘다 (가운데 자리는 그대로)
+fn keep_size(to: Rect, now: Rect) -> Rect {
+    if to.w == now.w && to.h == now.h {
+        return to;
+    }
+    Rect { x: to.x + (to.w - now.w) / 2, y: to.y + (to.h - now.h) / 2, w: now.w, h: now.h }
+}
+
 /// 직전 프레임이 화면에 보인 시간만큼 delay를 늘린다
 fn extend_last(s: &Shared, dt: Duration, carry: &mut Duration) {
     if let Some(prev) = s.frames.lock().last_mut() {
@@ -201,7 +209,11 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     let mut extend = true;
 
     while !s.stop.load(Ordering::SeqCst) {
-        if let Some(r) = s.region.lock().take()
+        // 녹화 도중에는 크기를 바꾸지 않고 자리만 옮긴다. 배율이 다른 모니터로 틀을 옮기면 같은 틀이라도
+        // 픽셀 크기가 달라지는데, 그대로 따라가면 MP4에는 크기가 다른 화면이 섞여 찢어지고
+        // 편집용 프레임도 크기가 섞여 저장할 때 앱이 꺼졌다.
+        let requested = s.region.lock().take();
+        if let Some(r) = requested.map(|r| keep_size(r, cap.region()))
             && r != cap.region()
             && let Err(e) = cap.set_region(r)
         {
@@ -259,8 +271,21 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
             recorded += dt;
         }
         if let Some(d) = &direct {
+            if d.failed() {
+                stop_reason = Some("MP4를 더 저장할 수 없어 녹화를 멈췄습니다 (디스크 공간을 확인해 주세요)".into());
+                break;
+            }
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64 + 1;
-            d.push(px.clone(), target.saturating_sub(written) as u32);
+            let copies = target.saturating_sub(written) as u32;
+            // 캡처가 밀려 여러 칸을 한꺼번에 채울 때, 지난 칸들은 그때 보이던 앞 화면으로 채우고 지금 화면은 한 칸만 넣는다.
+            // 모두 지금 화면으로 채우면 화면이 실제보다 일찍 바뀐 것처럼 저장된다.
+            match &last_px {
+                Some(prev) if copies > 1 => {
+                    d.push(prev.clone(), copies - 1);
+                    d.push(px.clone(), 1);
+                }
+                _ => d.push(px.clone(), copies),
+            }
             written = written.max(target);
         }
         let same = opts.skip_same_frame && last_px.as_ref().is_some_and(|l| **l == *px);
@@ -296,6 +321,10 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
         report(&s, &on_status, &mut last_report, false, recorded, bytes);
     }
 
+    // 소리에게 녹화 시간이 여기서 멈췄다고 알린다
+    if let (Some(a), Some(_)) = (&audio, last_tick) {
+        a.mark(audio::now(), false);
+    }
     // 마지막 프레임: 멈춘 시점까지 보인 시간, 최소 한 칸
     if let Some(t) = last_tick {
         let dt = t.elapsed();
@@ -306,12 +335,16 @@ fn run(mut cap: impl Screen, mut opts: RecordOptions, s: Arc<Shared>, on_status:
     }
     if let Some(d) = direct {
         // 마지막 화면을 멈춘 시점까지 채우고 파일을 마무리한다
-        if let Some(px) = &last_px {
+        let saved = if let Some(px) = &last_px {
             let target = (recorded.as_secs_f64() * fps as f64).round() as u64;
             d.push(px.clone(), target.saturating_sub(written) as u32);
             written = written.max(target);
-        }
-        let saved = d.finish().map_err(|e| format!("{e:#}"));
+            d.finish().map_err(|e| format!("{e:#}"))
+        } else {
+            // 화면을 한 장도 못 받았다(첫 캡처부터 실패 등): 빈 MP4를 남기지 않는다 (버리면 파일을 지운다)
+            drop(d);
+            Err("녹화된 화면이 없어 MP4를 만들지 않았습니다".to_string())
+        };
         if let Some(a) = audio {
             // 영상 길이 = 넣은 프레임 수 ÷ FPS
             let total = Duration::from_secs_f64(written as f64 / fps as f64);
@@ -409,6 +442,17 @@ mod tests {
         }
         assert!((9_999..=10_001).contains(&delay), "{delay}ms");
         assert!(carry < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn moving_while_recording_keeps_the_size() {
+        let now = Rect { x: 0, y: 0, w: 800, h: 600 };
+        // 크기가 같으면 그대로 옮긴다
+        let same = Rect { x: 100, y: 50, w: 800, h: 600 };
+        assert_eq!(keep_size(same, now), same);
+        // 배율이 1.5배인 모니터로 옮겨 픽셀 크기가 커져도, 가운데에 원래 크기로
+        let bigger = Rect { x: 2000, y: 100, w: 1200, h: 900 };
+        assert_eq!(keep_size(bigger, now), Rect { x: 2200, y: 250, w: 800, h: 600 });
     }
 
     #[test]

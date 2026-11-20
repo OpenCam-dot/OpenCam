@@ -168,7 +168,13 @@ fn index_at(st: &[u64], local: u64) -> usize {
     st.partition_point(|&s| s <= local).saturating_sub(1)
 }
 
-pub fn make(clips: &[Vec<Frame>], o: &CollageOptions, bg_image: Option<(u32, u32, Vec<u8>)>) -> Result<Vec<Frame>> {
+/// max_bytes: 결과가 쓸 수 있는 메모리(압축된 크기). 넘으면 만들지 않고 오류.
+pub fn make(
+    clips: &[Vec<Frame>],
+    o: &CollageOptions,
+    bg_image: Option<(u32, u32, Vec<u8>)>,
+    max_bytes: usize,
+) -> Result<Vec<Frame>> {
     let clips: Vec<&Vec<Frame>> = clips.iter().filter(|c| !c.is_empty()).collect();
     if clips.is_empty() {
         bail!("콜라주에 넣을 영상이 없습니다");
@@ -188,12 +194,25 @@ pub fn make(clips: &[Vec<Frame>], o: &CollageOptions, bg_image: Option<(u32, u32
     let used = clips.len().min(cells.len());
     let base = base_canvas(o, &cells, bg_image.as_ref());
 
-    // 영상마다 칸 크기에 맞춘 그림을 미리 만들어 둔다 (모서리 둥글기도 여기서)
-    let fitted: Vec<Vec<Vec<u8>>> = (0..used)
+    // 영상마다 칸 크기에 맞춘 그림을 미리 만들어 둔다 (모서리 둥글기도 여기서).
+    // 풀어 둔 채로 다 들고 있으면 긴 영상에서 메모리가 모자라므로 압축해 두고 붙일 때만 푼다.
+    // 같은 그림을 함께 쓰는 프레임(멈춘 화면 등)은 한 번만 만든다.
+    let fitted: Vec<Vec<Frame>> = (0..used)
         .into_par_iter()
         .map(|i| {
             let (_, _, cw, ch) = cells[i];
-            clips[i].iter().map(|f| fit_rounded(f.width, f.height, &f.rgba(), cw, ch, o.roundness)).collect()
+            let mut made: std::collections::HashMap<usize, Frame> = std::collections::HashMap::new();
+            clips[i]
+                .iter()
+                .map(|f| {
+                    made.entry(f.packed_key())
+                        .or_insert_with(|| {
+                            let px = fit_rounded(f.width, f.height, &f.rgba(), cw, ch, o.roundness);
+                            Frame::from_rgba(cw, ch, &px, 0)
+                        })
+                        .clone()
+                })
+                .collect()
         })
         .collect();
 
@@ -245,21 +264,36 @@ pub fn make(clips: &[Vec<Frame>], o: &CollageOptions, bg_image: Option<(u32, u32
         index_at(st, local)
     };
 
+    // 결과가 메모리 한도를 넘으면 더 만들지 않는다 (짧은 영상을 긴 영상에 맞춰 반복하면 수만 장이 될 수 있다)
+    let bytes = std::sync::atomic::AtomicUsize::new(0);
+    let over = || bytes.load(std::sync::atomic::Ordering::Relaxed) > max_bytes;
     let out: Vec<Frame> = merged
         .par_iter()
         .enumerate()
         .map(|(k, &t)| {
+            if over() {
+                return None;
+            }
             let end = merged.get(k + 1).copied().unwrap_or(total);
             let mut px = base.clone();
             for i in 0..used {
                 let (x, y, cw, ch) = cells[i];
-                paste(&mut px, o.width, &fitted[i][frame_at(i, t)], x, y, cw, ch);
+                paste(&mut px, o.width, &fitted[i][frame_at(i, t)].rgba(), x, y, cw, ch);
             }
             // 한 장의 시간은 들어온 프레임보다 거의 길어지지 않지만, 프레임 시간(u32 ms)을 넘지 않게 막아 둔다
             let delay = u32::try_from((end - t).max(10)).unwrap_or(u32::MAX);
-            Frame::from_rgba(o.width, o.height, &px, delay)
+            let f = Frame::from_rgba(o.width, o.height, &px, delay);
+            bytes.fetch_add(f.packed_bytes(), std::sync::atomic::Ordering::Relaxed);
+            Some(f)
         })
+        .while_some()
         .collect();
+    if over() || out.len() != merged.len() {
+        bail!(
+            "콜라주가 편집 메모리 한도를 넘어 만들지 않았습니다 ({}장). 캔버스 크기나 영상 길이를 줄이거나 설정에서 한도를 바꿔 주세요",
+            merged.len()
+        );
+    }
     Ok(out)
 }
 
@@ -305,7 +339,7 @@ mod tests {
         let mut o = opts(PlayMode::Hold);
         o.draw_border = true;
         o.border_color = [0, 0, 255];
-        let out = make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None).unwrap();
+        let out = make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None, usize::MAX).unwrap();
         assert_eq!(&out[0].rgba()[4 * 4..4 * 4 + 3], &[0, 0, 255]);
     }
 
@@ -314,13 +348,13 @@ mod tests {
         // 예전에는 칸이 캔버스 밖으로 나가 그리다가 프로그램이 꺼졌다
         let mut o = opts(PlayMode::Hold);
         o.margin = 6; // 가로 10에 여백 6×2
-        assert!(make(&[clip(1, 100, 9)], &o, None).is_err());
+        assert!(make(&[clip(1, 100, 9)], &o, None, usize::MAX).is_err());
         let mut o = opts(PlayMode::Hold);
         o.gap = 9; // 칸 2개 + 선 9 = 11 > 10
-        assert!(make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None).is_err());
+        assert!(make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None, usize::MAX).is_err());
         // 딱 맞으면 된다: 칸 1 + 선 8 + 칸 1 = 10
         o.gap = 8;
-        let out = make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None).unwrap();
+        let out = make(&[clip(1, 100, 9), clip(1, 100, 9)], &o, None, usize::MAX).unwrap();
         assert_eq!((out[0].width, out[0].height), (10, 4));
     }
 
@@ -342,13 +376,15 @@ mod tests {
     fn play_modes_total_time() {
         let a = clip(4, 100, 10); // 400ms
         let b = clip(2, 100, 200); // 200ms
-        let total = |m| make(&[a.clone(), b.clone()], &opts(m), None).unwrap().iter().map(|f| f.delay_ms).sum::<u32>();
+        let total = |m| make(&[a.clone(), b.clone()], &opts(m), None, usize::MAX).unwrap().iter().map(|f| f.delay_ms).sum::<u32>();
         assert_eq!(total(PlayMode::Hold), 400);
         assert_eq!(total(PlayMode::Repeat), 400);
         assert_eq!(total(PlayMode::Sync), 400);
         assert_eq!(total(PlayMode::Sequence), 600);
         // 반복: 300ms 지점에서 짧은 영상은 두 번째 바퀴의 두 번째 장면(초록 1)
-        let out = make(&[a.clone(), b.clone()], &opts(PlayMode::Repeat), None).unwrap();
+        // 메모리 한도를 넘으면 만들지 않는다
+        assert!(make(&[a.clone(), b.clone()], &opts(PlayMode::Repeat), None, 1).is_err());
+        let out = make(&[a.clone(), b.clone()], &opts(PlayMode::Repeat), None, usize::MAX).unwrap();
         let px = out[3].rgba();
         let i = (6 * 4) as usize; // 오른쪽 칸 첫 픽셀 (y=0, 2x2를 4x4로 늘린 것)
         assert_eq!(&px[i..i + 2], &[200, 1]);
@@ -362,7 +398,7 @@ mod tests {
         let long = 3_000_000_000;
         let a = clip(2, long, 10); // 60억 ms
         let b = clip(1, long, 200); // 30억 ms
-        let out = |m| make(&[a.clone(), b.clone()], &opts(m), None).unwrap();
+        let out = |m| make(&[a.clone(), b.clone()], &opts(m), None, usize::MAX).unwrap();
         let delays = |m| out(m).iter().map(|f| f.delay_ms).collect::<Vec<_>>();
         assert_eq!(delays(PlayMode::Hold), vec![long; 2]);
         assert_eq!(delays(PlayMode::Repeat), vec![long; 2]);

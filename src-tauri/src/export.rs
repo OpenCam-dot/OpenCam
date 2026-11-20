@@ -224,7 +224,15 @@ pub fn export_fit(
     if frames.is_empty() {
         bail!("저장할 프레임이 없습니다");
     }
+    // 무손실 WebP의 "화질"은 압축에 들이는 수고라서 100이 가장 작다. 낮추면 오히려 커지므로 화질은 건드리지 않는다.
+    let lossless = opt.format == Format::Webp && s.webp_lossless;
+    let fit = &FitOptions { allow_quality: fit.allow_quality && !lossless, ..fit.clone() };
     let steps = fit_ladder(frames, opt, fit);
+    // 모든 항목이 최소값인 설정. 아래에서 고른 설정들이 다 목표를 넘으면 마지막으로 이것을 저장해 본다.
+    let floor = steps.last().cloned();
+    let same_step = |a: &ExportOptions, b: &ExportOptions| {
+        (a.quality, a.limit_fps, a.resize_percent, a.skip_similar) == (b.quality, b.limit_fps, b.resize_percent, b.skip_similar)
+    };
     let d = median_delay(frames);
     let whole = frames.len() <= 40;
     // 구간마다 따로 저장해 크기를 더한다. WebP 인코더는 한 번에 코어 하나만 쓰므로 구간을 나란히 돌리면 빠르다.
@@ -253,6 +261,7 @@ pub fn export_fit(
         let (mut low, mut high) = (0usize, steps.len());
         let mut probes: Vec<(usize, f64)> = vec![];
         while low < high {
+            check_cancel()?;
             let mid = (low + high) / 2;
             let step = &steps[mid];
             progress((tries as f32 / rounds * 0.5).min(0.49), "예상 크기 계산 중");
@@ -315,13 +324,37 @@ pub fn export_fit(
                 None => break,
             }
         }
+        // 해 본 것이 모두 목표를 넘었으면 최소값까지 내려가 본다. 먼저 지금 목록의 마지막 단계,
+        // 그래도 넘으면 모든 항목이 최소인 설정(FPS를 고정해 다시 찾은 목록에는 최소 FPS가 없다).
+        // 예전에는 4번 해 보고 그만둬서, 더 낮출 수 있는데도 "목표에 못 맞췄다"고 알렸다.
+        let all_over = |real: &[(usize, u64)]| real.iter().all(|r| r.1 > fit.target_bytes);
+        let last = steps.len() - 1;
+        if all_over(&real) && !real.iter().any(|r| r.0 == last) {
+            let temp = dir.join(format!("fit_last.{}", opt.format.ext()));
+            let message = format!("가장 작은 설정으로 저장 - {}", fit_step_text(&steps[last], d));
+            export(frames, &temp, &steps[last], s, &|p, _| progress(0.9 + p.clamp(0.0, 1.0) * 0.05, &message))?;
+            real.push((last, std::fs::metadata(&temp)?.len()));
+            temps.push(temp);
+        }
+        let mut lowest: Option<(ExportOptions, PathBuf, u64)> = None;
+        if all_over(&real)
+            && let Some(floor) = floor.as_ref().filter(|f| !same_step(f, &steps[last]))
+        {
+            let temp = dir.join(format!("fit_floor.{}", opt.format.ext()));
+            let message = format!("가장 작은 설정으로 저장 - {}", fit_step_text(floor, d));
+            export(frames, &temp, floor, s, &|p, _| progress(0.95 + p.clamp(0.0, 1.0) * 0.05, &message))?;
+            let size = std::fs::metadata(&temp)?.len();
+            lowest = Some((floor.clone(), temp, size));
+        }
         // 목표 안에 든 것 중 가장 큰 설정(번호가 작은 것), 없으면 넘은 것 중 가장 작은 설정(번호가 큰 것)
         let fits = |k: &usize| real[*k].1 <= fit.target_bytes;
         let pick = (0..real.len()).filter(fits).min_by_key(|&k| real[k].0).map(|k| (k, true));
         let pick = pick.or_else(|| (0..real.len()).max_by_key(|&k| real[k].0).map(|k| (k, false)));
         let Some((k, fitted)) = pick else { bail!("저장한 결과가 없습니다") };
-        let (index, temp) = (real[k].0, temps[k].clone());
-        let step = &steps[index];
+        let (step, temp, fitted) = match lowest {
+            Some((step, temp, size)) => (step, temp, size <= fit.target_bytes),
+            None => (steps[real[k].0].clone(), temps[k].clone(), fitted),
+        };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
@@ -345,6 +378,27 @@ pub fn export_fit(
 }
 
 pub type Progress<'a> = &'a (dyn Fn(f32, &str) + Sync);
+
+/// 저장 취소 표시. 저장 창의 "취소"가 켜고, 인코더들이 프레임마다 확인해 멈춘다.
+static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 진행 중인 저장을 멈추게 한다 (`on = false`는 새 저장을 시작하기 전·끝난 뒤에 표시를 지울 때)
+pub fn set_cancel(on: bool) {
+    CANCEL.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn cancelled() -> bool {
+    CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+const CANCEL_MESSAGE: &str = "저장을 취소했습니다";
+
+fn check_cancel() -> Result<()> {
+    if cancelled() {
+        bail!(CANCEL_MESSAGE);
+    }
+    Ok(())
+}
 
 /// 저장 전 가공. 원본 프로젝트는 건드리지 않는다.
 pub fn prepare(frames: &[Frame], opt: &ExportOptions, s: &Settings) -> Vec<Frame> {
@@ -462,16 +516,37 @@ pub fn export(frames: &[Frame], path: &Path, opt: &ExportOptions, s: &Settings, 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    match opt.format {
+    if opt.format == Format::Png {
+        return png_sequence(&frames, path, progress);
+    }
+    // 옆에 임시 이름으로 만든 뒤 다 되면 바꿔 넣는다. 바로 덮어쓰면 저장이 실패하거나 취소됐을 때
+    // 원래 있던 파일까지 깨졌다. 확장자는 그대로 둔다 (ffmpeg가 확장자로 형식을 고른다).
+    let tmp = saving_path(path);
+    let made = match opt.format {
         Format::Gif => {
-            gif_direct(&frames, path, opt.quality, &opt.protect_colors, gif_keep_tolerance(opt.quality), s, progress)
+            gif_direct(&frames, &tmp, opt.quality, &opt.protect_colors, gif_keep_tolerance(opt.quality), s, progress)
         }
-        Format::Webp => webp(&frames, path, opt.quality, s, progress),
-        Format::Apng => apng(&frames, path, s, progress),
-        Format::Mp4 | Format::Webm | Format::Avif => video(&frames, path, opt.format, opt.quality, s, progress),
-        Format::Png => return png_sequence(&frames, path, progress),
-    }?;
+        Format::Webp => webp(&frames, &tmp, opt.quality, s, progress),
+        Format::Apng => apng(&frames, &tmp, s, progress),
+        _ => video(&frames, &tmp, opt.format, opt.quality, s, progress),
+    };
+    let moved = made.and_then(|()| {
+        if std::fs::rename(&tmp, path).is_err() {
+            // 다른 프로그램이 잠깐 잡고 있을 때 등: 복사로 한 번 더 해 본다
+            std::fs::copy(&tmp, path).with_context(|| format!("{}에 저장할 수 없습니다", path.display()))?;
+        }
+        Ok(())
+    });
+    let _ = std::fs::remove_file(&tmp);
+    moved?;
     Ok(vec![path.to_path_buf()])
+}
+
+/// 저장하는 동안 쓰는 임시 파일 이름 (같은 폴더, 같은 확장자)
+fn saving_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    path.with_file_name(format!("{stem}.saving-{}{ext}", std::process::id()))
 }
 
 /// 저장하지 않고 예상 크기만 계산 (임시 폴더에 써 보고 지운다).
@@ -715,6 +790,7 @@ fn write_gif<W: Write>(
             })
             .collect();
         for frame in encoded {
+            check_cancel()?;
             enc.write_lzw_pre_encoded_frame(&frame?)?;
             done += 1;
             progress(done as f32 / frames.len() as f32, "GIF 인코딩 중");
@@ -891,6 +967,7 @@ fn webp_part(frames: &[Frame], quality: u8, s: &Settings, step: &(dyn Fn() + Syn
     let mut enc = Encoder::new_with_options((w, h), opts).map_err(|e| anyhow!("WebP 인코더 오류: {e:?}"))?;
     let mut t = 0u64;
     for f in frames {
+        check_cancel()?;
         enc.add_frame(&f.rgba(), webp_stamp(t)?).map_err(|e| anyhow!("WebP 프레임 오류: {e:?}"))?;
         t += u64::from(f.delay_ms);
         step();
@@ -980,11 +1057,39 @@ fn quantize_shared(frames: &[Frame], quality: u8) -> Result<(Vec<u8>, Vec<u8>, V
         .par_iter()
         .map_init(|| res.clone(), |res, f| -> Result<_> { Ok(res.remapped(&mut to_img(f)?)?) })
         .collect::<Result<Vec<_>>>()?;
-    // 팔레트는 예전처럼 마지막 프레임 것을 쓴다
+    // 파일에는 팔레트가 하나만 들어간다. 그런데 색 번호를 매길 때마다 팔레트가 조금씩 다듬어져
+    // 프레임마다 팔레트가 다를 수 있다. 마지막 프레임 것을 쓰되, 팔레트가 다른 프레임은
+    // 그 프레임의 색 번호를 파일의 팔레트에서 가장 가까운 색의 번호로 바꿔 준다.
+    // (예전에는 번호를 그대로 써서 앞 프레임의 색이 조금 어긋났다.)
     let palette = mapped.last().map(|(pal, _)| pal.clone()).unwrap_or_default();
     let rgb = palette.iter().flat_map(|c| [c.r, c.g, c.b]).collect();
     let trns = palette.iter().map(|c| c.a).collect();
-    Ok((rgb, trns, mapped.into_iter().map(|(_, idx)| idx).collect()))
+    let indices = mapped
+        .into_par_iter()
+        .map(|(pal, mut idx)| {
+            if pal != palette {
+                let table = palette_map(&pal, &palette);
+                for i in idx.iter_mut() {
+                    *i = table[*i as usize];
+                }
+            }
+            idx
+        })
+        .collect();
+    Ok((rgb, trns, indices))
+}
+
+/// from 팔레트의 색 번호를 to 팔레트에서 가장 가까운 색의 번호로 바꾸는 표
+fn palette_map(from: &[imagequant::RGBA], to: &[imagequant::RGBA]) -> [u8; 256] {
+    let mut table = [0u8; 256];
+    for (i, c) in from.iter().enumerate().take(256) {
+        let dist = |t: &imagequant::RGBA| {
+            let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
+            d(c.r, t.r) + d(c.g, t.g) + d(c.b, t.b) + d(c.a, t.a) * 2
+        };
+        table[i] = to.iter().enumerate().min_by_key(|(_, t)| dist(t)).map_or(0, |(k, _)| k as u8);
+    }
+    table
 }
 
 /// APNG 프레임 시간은 "분자/분모 초"이고 둘 다 u16이다.
@@ -1040,6 +1145,7 @@ fn apng(frames: &[Frame], path: &Path, s: &Settings, progress: Progress) -> Resu
     enc.set_animated(frames.len() as u32, plays(s.apng_finite_loop, s.apng_loop_count).map_or(0, u32::from))?;
     let mut writer = enc.write_header()?;
     for (i, f) in frames.iter().enumerate() {
+        check_cancel()?;
         let (num, den) = apng_delay(f.delay_ms);
         writer.set_frame_delay(num, den)?;
         match &indexed {
@@ -1119,16 +1225,51 @@ pub(crate) fn spawn_stderr_tail(
     })
 }
 
+/// 동영상 저장의 고정 FPS를 분수(분자, 분모)로 정한다. 프레임 시간이 모두 한 칸의 정수배가 되게
+/// 프레임 시간들의 최대공약수를 쓰고, 60FPS를 넘으면 60FPS로 둔다(1FPS 아래로는 내리지 않는다).
+/// 예전에는 1000을 가장 짧은 시간으로 나눈 몫(정수)을 써서, 600ms 프레임이 1FPS 한 칸(1초)이 되어 영상이 느려졌다.
+fn video_rate(delays: impl Iterator<Item = u32>) -> (u64, u64) {
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let mut g = 0u64;
+    let mut min = u64::MAX;
+    for d in delays {
+        let d = d.max(10) as u64;
+        g = gcd(g, d);
+        min = min.min(d);
+    }
+    if g == 0 {
+        return (10, 1); // 프레임이 없을 때 (예전 기본값 100ms와 같음)
+    }
+    // 한 칸 길이(ms): 모두 나누어떨어지는 길이가 너무 짧으면 가장 짧은 프레임 길이
+    let step = if g >= 17 { g } else { min };
+    if step < 17 {
+        (60, 1)
+    } else if step > 1000 {
+        (1, 1)
+    } else {
+        let k = gcd(1000, step);
+        (1000 / k, step / k)
+    }
+}
+
+/// 누적 시간 t(ms)까지 들어가야 하는 출력 프레임 수. 반올림해서 전체 시간이 어긋나지 않게 한다.
+fn output_frames_until(t: u64, fps_num: u64, fps_den: u64, written: u64) -> u64 {
+    let n = t as u128 * fps_num as u128;
+    let d = fps_den as u128 * 1000;
+    (((n * 2 + d) / (d * 2)) as u64).max(written)
+}
+
 fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Settings, progress: Progress) -> Result<()> {
     let mut cmd = ffmpeg()
         .ok_or_else(|| anyhow!("ffmpeg.exe를 찾을 수 없습니다. ffmpeg를 설치하거나 프로그램 폴더에 넣어 주세요."))?;
     let (w, h) = (frames[0].width, frames[0].height);
-    // 프레임마다 시간이 달라서, 가장 짧은 프레임 기준의 고정 FPS로 맞춰 같은 화면을 반복해서 넣는다
-    let min_delay = frames.iter().map(|f| f.delay_ms.max(10)).min().unwrap_or(100);
-    let fps = (1000 / min_delay).clamp(1, 60);
+    // 프레임마다 시간이 달라서, 고정 FPS로 맞춰 같은 화면을 반복해서 넣는다
+    let (fps_num, fps_den) = video_rate(frames.iter().map(|f| f.delay_ms));
     let q = quality.min(100) as f32;
     cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba"])
-        .args(["-s", &format!("{w}x{h}"), "-r", &fps.to_string(), "-i", "-"])
+        .args(["-s", &format!("{w}x{h}"), "-r", &format!("{fps_num}/{fps_den}"), "-i", "-"])
         // yuv420p는 가로·세로가 짝수여야 한다
         .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
     match format {
@@ -1165,6 +1306,8 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
         }
     };
     // MP4는 투명을 못 쓴다: "다른 색으로 바꾸기"가 켜져 있으면 그 색, 아니면 검정 위에 합성
+    // 저장을 취소해서 도중에 멈췄나
+    let mut stopped = false;
     let matte = matches!(format, Format::Mp4 | Format::Avif)
         .then(|| if s.mp4_replace_transparent { bgr(s.transparent_replace_color) } else { [0, 0, 0] });
     {
@@ -1172,8 +1315,20 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
         let mut written = 0u64; // 지금까지 넣은 출력 프레임 수
         let mut t = 0u64;
         'outer: for (i, f) in frames.iter().enumerate() {
+            if cancelled() {
+                stopped = true;
+                break 'outer;
+            }
             t += f.delay_ms as u64;
-            let until = (t * fps as u64 / 1000).max(written + 1);
+            let mut until = output_frames_until(t, fps_num, fps_den, written);
+            if i + 1 == frames.len() && until == 0 {
+                until = 1; // 아주 짧은 영상이라도 한 장은 넣는다
+            }
+            if until == written {
+                // 출력 한 칸보다 짧은 프레임: 건너뛰어도 전체 시간은 그대로다
+                progress((i + 1) as f32 / frames.len() as f32 * 0.95, "동영상 인코딩 중");
+                continue;
+            }
             let mut px = f.rgba();
             if let Some(c) = matte {
                 composite_over(&mut px, c);
@@ -1189,6 +1344,9 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
         let _ = stdin.flush();
         // 여기서 stdin이 닫혀야 ffmpeg가 끝난다
     }
+    if stopped {
+        let _ = child.kill();
+    }
     let status = child.wait();
     if status.is_err() {
         let _ = child.kill();
@@ -1196,6 +1354,9 @@ fn video(frames: &[Frame], path: &Path, format: Format, quality: u8, s: &Setting
     }
     // ffmpeg가 끝나 stderr가 닫히면 스레드도 끝난다
     let err = err_tail.join().unwrap_or_default();
+    if stopped {
+        bail!(CANCEL_MESSAGE);
+    }
     if !status?.success() {
         bail!("ffmpeg 오류: {err}");
     }
@@ -1208,6 +1369,8 @@ pub struct Mp4Stream {
     child: std::process::Child,
     tx: Option<std::sync::mpsc::SyncSender<(std::sync::Arc<Vec<u8>>, u32)>>,
     writer: Option<std::thread::JoinHandle<()>>,
+    /// ffmpeg가 더 받지 못하게 됐다 (디스크가 가득 참, ffmpeg가 꺼짐 등)
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Mp4Stream {
@@ -1233,17 +1396,25 @@ impl Mp4Stream {
         let mut stdin = BufWriter::new(child.stdin.take().unwrap());
         // 녹화가 잠깐 밀려도 버틸 만큼만 쌓아 둔다 (너무 밀리면 녹화가 기다린다)
         let (tx, rx) = std::sync::mpsc::sync_channel::<(std::sync::Arc<Vec<u8>>, u32)>(8);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = failed.clone();
         let writer = std::thread::spawn(move || {
             for (px, copies) in rx {
                 for _ in 0..copies {
                     if stdin.write_all(&px).is_err() {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         return;
                     }
                 }
             }
             let _ = stdin.flush();
         });
-        Ok(Mp4Stream { path: path.to_path_buf(), child, tx: Some(tx), writer: Some(writer) })
+        Ok(Mp4Stream { path: path.to_path_buf(), child, tx: Some(tx), writer: Some(writer), failed })
+    }
+
+    /// 더 저장할 수 없게 됐나 (디스크가 가득 참 등). 녹화하는 쪽이 보고 녹화를 멈춘다.
+    pub fn failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 같은 화면을 copies장 넣는다 (화면이 안 바뀐 시간만큼)
@@ -1265,7 +1436,24 @@ impl Mp4Stream {
         if !status.success() {
             bail!("MP4 바로 저장 실패 (ffmpeg 종료 코드 {:?})", status.code());
         }
-        Ok(self.path)
+        Ok(self.path.clone())
+    }
+}
+
+impl Drop for Mp4Stream {
+    /// finish 없이 버려졌으면(녹화 시작 실패, 화면이 한 장도 없음) ffmpeg를 끄고 만들던 파일을 지운다.
+    /// 그냥 두면 빈 MP4가 저장 폴더에 남았다.
+    fn drop(&mut self) {
+        if self.tx.is_none() {
+            return; // finish가 이미 마무리했다
+        }
+        drop(self.tx.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -1356,6 +1544,7 @@ fn png_sequence(frames: &[Frame], path: &Path, progress: Progress) -> Result<Vec
     let paths = png_sequence_paths(path, frames.len());
     let done = std::sync::atomic::AtomicUsize::new(0);
     frames.par_iter().zip(paths.par_iter()).try_for_each(|(f, p)| -> Result<()> {
+        check_cancel()?;
         write_png(p, f.width, f.height, &f.rgba())?;
         let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         progress(n as f32 / frames.len() as f32, "PNG 저장 중");
@@ -1468,6 +1657,60 @@ pub fn probe_audio(path: &Path) -> (bool, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 프레임 시간들을 동영상으로 옮겼을 때의 전체 길이(ms)
+    fn video_length_ms(delays: &[u32]) -> f64 {
+        let (num, den) = video_rate(delays.iter().copied());
+        let mut written = 0;
+        let mut t = 0u64;
+        for (i, d) in delays.iter().enumerate() {
+            t += *d as u64;
+            let mut until = output_frames_until(t, num, den, written);
+            if i + 1 == delays.len() && until == 0 {
+                until = 1;
+            }
+            written = until;
+        }
+        written as f64 * den as f64 * 1000.0 / num as f64
+    }
+
+    #[test]
+    fn video_keeps_the_original_length() {
+        // 600ms 슬라이드 10장 = 6초 (예전에는 1FPS가 되어 10초였다)
+        assert_eq!(video_rate([600u32; 10].into_iter()), (5, 3));
+        assert!((video_length_ms(&[600; 10]) - 6000.0).abs() < 1.0);
+        // 100FPS 녹화(10ms) 300장 = 3초 (예전에는 60FPS로 한 장씩 넣어 5초였다)
+        assert_eq!(video_rate([10u32; 300].into_iter()), (60, 1));
+        assert!((video_length_ms(&[10; 300]) - 3000.0).abs() < 17.0);
+        // 서로 다른 시간이 섞여도 전체 길이는 한 칸 안에서 맞는다
+        let mixed = [40, 50, 40, 50, 600, 33, 33, 34, 1500];
+        let total: u32 = mixed.iter().sum();
+        assert!((video_length_ms(&mixed) - total as f64).abs() < 17.0);
+        // 아주 긴 프레임만 있으면 1FPS
+        assert_eq!(video_rate([3000u32, 5000].into_iter()), (1, 1));
+        assert!((video_length_ms(&[3000, 5000]) - 8000.0).abs() < 1.0);
+        // 아주 짧은 한 장도 한 칸은 들어간다
+        assert!(video_length_ms(&[10]) > 0.0);
+    }
+
+    #[test]
+    fn abandoned_direct_mp4_leaves_no_file() {
+        if find_ffmpeg().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("opencam_mp4_drop_{}", std::process::id()));
+        let path = dir.join("v.mp4");
+        let stream = Mp4Stream::start(&path, 16, 16, 10, 80, true).unwrap();
+        stream.push(std::sync::Arc::new(vec![0; 16 * 16 * 4]), 3);
+        drop(stream);
+        assert!(!path.exists(), "finish 없이 버린 MP4는 지운다");
+        // finish한 것은 그대로 남는다
+        let stream = Mp4Stream::start(&path, 16, 16, 10, 80, true).unwrap();
+        stream.push(std::sync::Arc::new(vec![0; 16 * 16 * 4]), 3);
+        let saved = stream.finish().unwrap();
+        assert!(saved.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sound_is_encoded_while_recording_and_joined_to_the_video_in_sync() {
@@ -1653,9 +1896,33 @@ mod tests {
         let target = (largest + smallest) / 2;
         let (_, medium) = export_fit(&input, &path, &opt, &fit(target), &s, &|_, _| {}).unwrap();
         assert!(!medium.fitted || std::fs::metadata(&path).unwrap().len() <= target);
+        // 무손실 WebP는 화질을 낮추면 오히려 커진다: 화질은 그대로 두고 크기만 줄인다
+        let lossless = Settings { webp_lossless: true, ..Settings::default() };
+        let (_, kept) = export_fit(&input, &path, &opt, &fit(1), &lossless, &|_, _| {}).unwrap();
+        assert_eq!((kept.quality, kept.resize_percent), (opt.quality, 50));
         let prefix = format!("opencam_fit_{}_", std::process::id());
         assert!(!std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(&prefix)));
+        // 저장하는 동안 쓰는 임시 파일은 남지 않는다
+        assert!(!saving_path(&path).exists());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn palette_numbers_are_moved_to_the_nearest_color() {
+        let c = |r, g, b| imagequant::RGBA::new(r, g, b, 255);
+        // 같은 색들이 순서만 다르고 조금 다듬어진 두 팔레트
+        let from = [c(250, 0, 0), c(0, 0, 250), c(10, 240, 10)];
+        let to = [c(0, 0, 255), c(0, 255, 0), c(255, 0, 0)];
+        let table = palette_map(&from, &to);
+        assert_eq!(&table[..3], &[2, 0, 1]);
+    }
+
+    #[test]
+    fn saving_path_keeps_folder_and_extension() {
+        let p = saving_path(Path::new("C:/a/b/clip.final.mp4"));
+        assert_eq!(p.parent(), Some(Path::new("C:/a/b")));
+        assert_eq!(p.extension().unwrap(), "mp4");
+        assert_ne!(p, Path::new("C:/a/b/clip.final.mp4"));
     }
 
     #[test]
@@ -2329,6 +2596,12 @@ mod tests {
         let p = dir.join("t.avif");
         export(&fr, &p, &opts(Format::Avif), &s, &|_, _| {}).unwrap();
         assert!(std::fs::metadata(&p).unwrap().len() > 0);
+        // 저장한 AVIF를 다시 열 수 있다 (대표 그림 한 장이 아니라 움직이는 영상 4장)
+        let path = p.to_string_lossy();
+        let info = crate::import::probe_video(&path).unwrap();
+        assert_eq!((info.width, info.height, info.fps.round() as u32), (16, 8, 10));
+        let back = crate::import::load_video(&path, 0, info.duration_ms, 10.0, 16, 8, usize::MAX, &|_, _| {}).unwrap();
+        assert_eq!(back.frames.len(), 4);
         // 바로 저장: 3장을 넣으면(앞 장은 2번) 4프레임짜리 MP4
         let m = Mp4Stream::start(&dir.join("d.mp4"), 16, 8, 10, 90, true).unwrap();
         m.push(std::sync::Arc::new(fr[0].rgba()), 2);

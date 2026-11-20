@@ -117,6 +117,12 @@ impl Dib {
                 let _ = DeleteDC(dc);
                 return None;
             };
+            // 버퍼를 못 받았으면(메모리 부족 등) 쓰지 않는다. 빈 주소로 픽셀을 읽으면 프로그램이 꺼진다.
+            if bits.is_null() || w <= 0 || h <= 0 {
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+                return None;
+            }
             let old = SelectObject(dc, bmp.into());
             Some(Dib { dc, bmp, old, bits: bits as *mut u8 })
         }
@@ -177,8 +183,6 @@ unsafe fn draw_loop(hwnd: HWND, src_n: i32, size: i32) {
             ReleaseDC(None, screen);
             return;
         };
-        let src_px = std::slice::from_raw_parts(src.bits, (src_n * src_n * 4) as usize);
-        let dst_px = std::slice::from_raw_parts_mut(dst.bits, (size * size * 4) as usize);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -201,6 +205,10 @@ unsafe fn draw_loop(hwnd: HWND, src_n: i32, size: i32) {
                 let rop = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
                 if BitBlt(src.dc, 0, 0, src_n, src_n, Some(screen), cur.x - half, cur.y - half, rop).is_ok() {
                     let _ = GdiFlush();
+                    // 픽셀은 화면 복사(BitBlt)가 끝난 뒤, 그리는 동안에만 빌린다.
+                    // 미리 빌려 둔 채 Windows가 같은 메모리를 바꾸게 두면 Rust의 약속(빌린 동안 안 바뀜)을 어긴다.
+                    let src_px = std::slice::from_raw_parts(src.bits, (src_n * src_n * 4) as usize);
+                    let dst_px = std::slice::from_raw_parts_mut(dst.bits, (size * size * 4) as usize);
                     render(src_px, src_n, dst_px, size);
                     let pos = lens_position(cur, size);
                     let sz = SIZE { cx: size, cy: size };

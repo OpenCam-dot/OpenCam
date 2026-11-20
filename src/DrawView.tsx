@@ -78,11 +78,23 @@ export default function DrawView({ frame, scale, onApply, onCancel }: Props) {
   const [scope, setScope] = useState<Scope>("current");
   useReportDirty(strokes.length > 0);
 
+  /** 다 그린 획들을 모아 둔 그림. 획 목록이 바뀔 때만 다시 만든다. */
+  const done = useRef<{ strokes: Stroke[]; canvas: HTMLCanvasElement } | null>(null);
   const redraw = (extra?: Stroke | null) => {
     const ctx = canvas.current?.getContext("2d");
     if (!ctx) return;
+    // 마우스가 움직일 때마다 모든 획을 처음부터 다시 그리면 획이 많아질수록 느려진다.
+    // 다 그린 획은 한 번만 그려 두고, 움직이는 동안에는 그 그림 위에 지금 긋는 획만 그린다.
+    if (done.current?.strokes !== strokes || done.current.canvas.width !== W || done.current.canvas.height !== H) {
+      const c = document.createElement("canvas");
+      c.width = W;
+      c.height = H;
+      const g = c.getContext("2d")!;
+      for (const s of strokes) paintStroke(g, s, W, H);
+      done.current = { strokes, canvas: c };
+    }
     ctx.clearRect(0, 0, W, H);
-    for (const s of strokes) paintStroke(ctx, s, W, H);
+    ctx.drawImage(done.current.canvas, 0, 0);
     if (extra) paintStroke(ctx, extra, W, H);
   };
 

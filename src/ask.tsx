@@ -48,7 +48,8 @@ export function AskHost() {
 
   const cur = queue[0];
   if (!cur) return null;
-  const done = () => setQueue((q) => q.slice(1));
+  // 지금 보이는 물음만 뺀다. 맨 앞을 빼면, 버튼을 빠르게 두 번 눌렀을 때 다음 물음까지 사라져 답을 영영 못 받았다.
+  const done = () => setQueue((q) => q.filter((r) => r !== cur));
   const cancel = () => {
     if (cur.kind === "confirm") cur.resolve(false);
     else if (cur.kind === "prompt" || cur.kind === "choose") cur.resolve(null);

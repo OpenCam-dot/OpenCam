@@ -86,7 +86,7 @@ pub fn save(dir: &Path, frames: &[Frame], stop: &AtomicBool) -> Result<()> {
         }
         return Err(e);
     }
-    let used: HashSet<String> = frames.iter().map(|f| format!("{}.lz4", frame_stem(session(), f.id))).collect();
+    let used: HashSet<String> = frames.iter().map(|f| format!("{}.lz4", frame_stem(session(), f.pixels_id()))).collect();
     for e in std::fs::read_dir(&fdir)?.flatten() {
         if !used.contains(&*e.file_name().to_string_lossy()) {
             let _ = std::fs::remove_file(e.path());
@@ -101,7 +101,7 @@ fn pending_bytes(dir: &Path, frames: &[Frame]) -> u64 {
     let mut seen = HashSet::new();
     frames
         .iter()
-        .filter(|f| seen.insert(f.id) && !fdir.join(format!("{}.lz4", frame_stem(session(), f.id))).exists())
+        .filter(|f| seen.insert(f.pixels_id()) && !fdir.join(format!("{}.lz4", frame_stem(session(), f.pixels_id()))).exists())
         .map(|f| f.packed_bytes() as u64)
         .sum()
 }
@@ -124,11 +124,17 @@ fn write_frames(
     stop: &AtomicBool,
     written: &mut Vec<PathBuf>,
 ) -> Result<()> {
+    // 같은 그림을 함께 쓰는 프레임은 파일 하나만 쓴다. 프레임마다 쓰면 빈 영상(36,000장이 그림 하나)이나
+    // 복제한 프레임이 파일 수만 개가 됐다.
+    let mut seen = HashSet::new();
     for f in frames {
         if stop.load(Ordering::SeqCst) {
             bail!("자동 저장을 멈췄습니다");
         }
-        let stem = frame_stem(session(), f.id);
+        if !seen.insert(f.pixels_id()) {
+            continue;
+        }
+        let stem = frame_stem(session(), f.pixels_id());
         let path = fdir.join(format!("{stem}.lz4"));
         if !path.exists() {
             let tmp = fdir.join(format!("{stem}.tmp"));
@@ -144,7 +150,7 @@ fn write_frames(
         saved_at: chrono::Local::now().timestamp_millis(),
         frames: frames
             .iter()
-            .map(|f| FrameEntry { file: f.id, width: f.width, height: f.height, delay_ms: f.delay_ms, tags: f.tags })
+            .map(|f| FrameEntry { file: f.pixels_id(), width: f.width, height: f.height, delay_ms: f.delay_ms, tags: f.tags })
             .collect(),
     };
     let tmp = dir.join("manifest.tmp");
@@ -236,15 +242,42 @@ pub fn entry_dir(root: &Path, id: &str) -> Result<PathBuf> {
 pub fn load(dir: &Path) -> Result<Vec<Frame>> {
     let m = read_manifest(dir)?;
     let fdir = dir.join("frames");
-    m.frames
+    // 파일마다 한 번만 읽고, 같은 파일을 쓰는 프레임은 그림을 함께 쓴다 (파일마다 처음 나온 항목으로 읽는다)
+    let mut firsts: Vec<&FrameEntry> = vec![];
+    let mut seen = HashSet::new();
+    for e in &m.frames {
+        if seen.insert(e.file) {
+            firsts.push(e);
+        }
+    }
+    let pictures: std::collections::HashMap<u64, Frame> = firsts
         .par_iter()
         .map(|e| {
             let data = std::fs::read(fdir.join(format!("{}.lz4", frame_stem(&m.session, e.file))))
                 .with_context(|| format!("프레임 파일이 없습니다 ({})", e.file))?;
-            Frame::from_packed(e.width, e.height, e.delay_ms, e.tags, data)
-                .with_context(|| format!("프레임 파일이 깨졌습니다 ({})", e.file))
+            let f = Frame::from_packed(e.width, e.height, e.delay_ms, e.tags, data)
+                .with_context(|| format!("프레임 파일이 깨졌습니다 ({})", e.file))?;
+            Ok((e.file, f))
+        })
+        .collect::<Result<_>>()?;
+    m.frames
+        .iter()
+        .map(|e| {
+            let base = &pictures[&e.file];
+            if (base.width, base.height) != (e.width, e.height) {
+                bail!("프레임 파일이 깨졌습니다 ({})", e.file);
+            }
+            let mut f = base.duplicate().with_delay(e.delay_ms);
+            f.tags = e.tags;
+            Ok(f)
         })
         .collect()
+}
+
+/// dir에 다른 실행이 남긴 작업(아직 복구 목록으로 옮기지 못한 것)이 있는가.
+/// 있으면 자동 저장이 이 폴더를 지우거나 덮어쓰면 안 된다.
+pub fn holds_leftover(dir: &Path) -> bool {
+    read_manifest(dir).is_ok_and(|m| !m.frames.is_empty() && m.session != session())
 }
 
 /// 첫 프레임 (미리보기용)
@@ -284,7 +317,29 @@ mod tests {
     }
 
     fn file_of(dir: &Path, f: &Frame) -> PathBuf {
-        dir.join("frames").join(format!("{}.lz4", frame_stem(session(), f.id)))
+        dir.join("frames").join(format!("{}.lz4", frame_stem(session(), f.pixels_id())))
+    }
+
+    #[test]
+    fn frames_sharing_a_picture_use_one_file_and_load_shared() {
+        let root = temp_root("shared");
+        let dir = root.join("w");
+        let a = frame(7, 100);
+        let mut tagged = a.duplicate().with_delay(40);
+        tagged.tags = 2;
+        // 같은 그림 3장(번호는 서로 다름) + 다른 그림 1장
+        let frames = vec![a.clone(), tagged, a.duplicate(), frame(9, 10)];
+        save(&dir, &frames, &GO).unwrap();
+        assert_eq!(std::fs::read_dir(dir.join("frames")).unwrap().count(), 2);
+        let back = load(&dir).unwrap();
+        assert_eq!(back.iter().map(|f| (f.delay_ms, f.tags)).collect::<Vec<_>>(), [(100, 0), (40, 2), (100, 0), (10, 0)]);
+        assert_eq!(back[0].packed_key(), back[1].packed_key());
+        assert_eq!(back[0].packed_key(), back[2].packed_key());
+        assert_ne!(back[0].packed_key(), back[3].packed_key());
+        assert_eq!(back[0].rgba(), a.rgba());
+        // 이번 실행이 쓴 것은 "남은 작업"이 아니다
+        assert!(!holds_leftover(&dir));
+        clear(&root);
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -348,7 +403,7 @@ mod tests {
         let cur = current(&root);
         let a = frame(10, 100);
         std::fs::create_dir_all(cur.join("frames")).unwrap();
-        std::fs::write(cur.join("frames").join(format!("{}.lz4", a.id)), frame(200, 100).packed()).unwrap();
+        std::fs::write(cur.join("frames").join(format!("{}.lz4", a.pixels_id())), frame(200, 100).packed()).unwrap();
         save(&cur, std::slice::from_ref(&a), &GO).unwrap();
         assert_eq!(load(&cur).unwrap()[0].rgba()[0], 10);
         // 남은 옛 파일은 저장하면서 정리한다
@@ -366,7 +421,7 @@ mod tests {
         let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(cur.join(MANIFEST)).unwrap()).unwrap();
         m.as_object_mut().unwrap().remove("session");
         std::fs::write(cur.join(MANIFEST), serde_json::to_vec(&m).unwrap()).unwrap();
-        std::fs::rename(file_of(&cur, &a), cur.join("frames").join(format!("{}.lz4", a.id))).unwrap();
+        std::fs::rename(file_of(&cur, &a), cur.join("frames").join(format!("{}.lz4", a.pixels_id()))).unwrap();
         assert_eq!(load(&cur).unwrap()[0].rgba()[0], 7);
         assert_eq!(first_frame(&cur).unwrap().rgba()[0], 7);
         clear(&root);
@@ -411,7 +466,7 @@ mod tests {
         let (old, a, b) = (frame(1, 10), frame(2, 10), frame(3, 10));
         save(&cur, std::slice::from_ref(&old), &GO).unwrap();
         // b를 쓸 자리에 폴더를 만들어 두어 쓰기가 실패하게 한다
-        std::fs::create_dir_all(cur.join("frames").join(format!("{}.tmp", frame_stem(session(), b.id)))).unwrap();
+        std::fs::create_dir_all(cur.join("frames").join(format!("{}.tmp", frame_stem(session(), b.pixels_id())))).unwrap();
         assert!(save(&cur, &[old.clone(), a.clone(), b.clone()], &GO).is_err());
         assert!(!file_of(&cur, &a).exists());
         assert!(file_of(&cur, &old).exists());

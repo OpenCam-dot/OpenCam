@@ -348,45 +348,59 @@ pub fn eraser(px: &mut [u8], w: u32, h: u32, region: Region) {
             }
         }
     }
-    // 바깥에서 안으로 한 겹씩
-    while todo > 0 {
-        let mut layer = vec![];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let i = (y * wi + x) as usize;
-                if known[i] {
-                    continue;
-                }
-                let mut sum = [0u32; 4];
-                let mut n = 0;
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (xx, yy) = (x + dx, y + dy);
-                        if (dx, dy) == (0, 0) || xx < 0 || yy < 0 || xx >= wi || yy >= hi {
-                            continue;
-                        }
-                        let j = (yy * wi + xx) as usize;
-                        if known[j] {
-                            for c in 0..4 {
-                                sum[c] += px[j * 4 + c] as u32;
-                            }
-                            n += 1;
-                        }
-                    }
-                }
-                if n > 0 {
-                    layer.push((i, sum.map(|s| (s / n) as u8)));
-                }
+    // 바깥에서 안으로 한 겹씩. 겹마다 영역 전체를 다시 훑으면 큰 영역에서 수백 번을 훑게 되므로,
+    // 이번 겹에서 채울 픽셀(아는 픽셀과 맞닿은 곳)만 목록으로 들고 다닌다. 결과는 전체를 훑을 때와 같다.
+    let neighbors = |i: usize| {
+        let (x, y) = ((i as i32) % wi, (i as i32) / wi);
+        (-1..=1).flat_map(move |dy| (-1..=1).map(move |dx| (x + dx, y + dy, dx, dy))).filter_map(move |(xx, yy, dx, dy)| {
+            ((dx, dy) != (0, 0) && xx >= 0 && yy >= 0 && xx < wi && yy < hi).then(|| (yy * wi + xx) as usize)
+        })
+    };
+    // 목록에 이미 넣었나 (같은 픽셀을 두 번 넣지 않게)
+    let mut queued = vec![false; (w * h) as usize];
+    let mut frontier: Vec<usize> = vec![];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * wi + x) as usize;
+            if !known[i] && neighbors(i).any(|j| known[j]) {
+                queued[i] = true;
+                frontier.push(i);
             }
         }
-        if layer.is_empty() {
-            break; // 프레임 전체가 영역이면 채울 수 없다
-        }
-        for (i, c) in layer {
+    }
+    // 목록이 비면 끝 (프레임 전체가 영역이면 채울 수 없다)
+    while todo > 0 && !frontier.is_empty() {
+        let layer: Vec<(usize, [u8; 4])> = frontier
+            .iter()
+            .map(|&i| {
+                let mut sum = [0u32; 4];
+                let mut n = 0;
+                for j in neighbors(i).filter(|&j| known[j]) {
+                    for c in 0..4 {
+                        sum[c] += px[j * 4 + c] as u32;
+                    }
+                    n += 1;
+                }
+                (i, sum.map(|s| (s / n.max(1)) as u8))
+            })
+            .collect();
+        for &(i, c) in &layer {
             px[i * 4..i * 4 + 4].copy_from_slice(&c);
             known[i] = true;
             todo -= 1;
         }
+        // 다음 겹: 방금 채운 픽셀과 맞닿은, 아직 모르는 픽셀 (훑는 순서를 지키려고 번호순으로)
+        let mut next = vec![];
+        for &(i, _) in &layer {
+            for j in neighbors(i) {
+                if !known[j] && !queued[j] {
+                    queued[j] = true;
+                    next.push(j);
+                }
+            }
+        }
+        next.sort_unstable();
+        frontier = next;
     }
     // 채운 곳의 얼룩을 조금 부드럽게
     for _ in 0..2 {

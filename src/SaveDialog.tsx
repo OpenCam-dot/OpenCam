@@ -104,9 +104,10 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
   const [protect, setProtect] = useState<string[]>([]);
   const [fmt, setFmt] = useState<FormatOpts>(() => Object.fromEntries(FORMAT_KEYS.map((k) => [k, settings[k]])) as FormatOpts);
   const setF = <K extends keyof FormatOpts>(k: K, v: FormatOpts[K]) => setFmt((c) => ({ ...c, [k]: v }));
-  // 저장·예상 크기 계산은 Rust가 가진 설정으로 하므로 형식별 옵션을 먼저 넣어 둔다.
-  // 단축키 등록이 실패해도 설정 자체는 저장되므로 그 오류는 넘긴다.
-  const applyFmt = () => api.setSettings({ ...settings, ...fmt }).catch(() => {});
+  // 저장하는 중인가. 오류 글과 따로 둔다: 저장 도중 예상 크기 계산이 실패해 오류가 떠도 저장 중 잠금이 풀리지 않게.
+  const [saving, setSaving] = useState(false);
+  // "찾아보기"에서 덮어쓰기를 이미 확인한 경로 (같은 것을 두 번 묻지 않는다)
+  const confirmedPath = useRef("");
 
   useEffect(() => {
     api.hasFfmpeg().then(setFfmpeg);
@@ -147,19 +148,20 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
   const autoFps = fitting && allowFps;
   const autoResize = fitting && allowResize;
   const tooFast = format === "gif" && (autoFps || !limitFps) && frames.some((f) => f.delayMs < 20);
-  const working = progress !== null && !done && !error;
+  const working = saving;
 
   const calc = async () => {
     const run = ++estimateRun.current;
     setEstimate("계산 중…");
     try {
-      await applyFmt();
-      const size = await api.estimateSize(opts());
+      // 형식별 옵션은 이번 계산에만 넘긴다 (계산만 했는데 설정에 저장되지 않게)
+      const size = await api.estimateSize(opts(), fmt);
       if (run === estimateRun.current) setEstimate(formatBytes(size));
     } catch (e) {
       if (run !== estimateRun.current) return;
       setEstimate(null);
-      setError(errText(e));
+      // 저장하는 중이면 저장 쪽 결과가 곧 나오므로 계산 오류로 덮지 않는다
+      if (!saving) setError(errText(e));
     }
   };
 
@@ -182,14 +184,16 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
       fit50 = pick === 0;
     }
     setError(null);
+    setSaving(true);
     setProgress({ p: 0, msg: "준비 중" });
     const un = await listen<{ progress: number; message: string }>("export-progress", (e) =>
       setProgress({ p: e.payload.progress, msg: e.payload.message }),
     );
     try {
       const o = { ...opts(), gifFit50fps: fit50 };
-      if (format === "png") {
-        const conflicts = await api.exportConflicts(o, target);
+      // 같은 이름의 파일이 있으면 묻는다 ("찾아보기" 창에서 이미 덮어쓰기로 고른 경로는 다시 묻지 않는다)
+      if (target !== confirmedPath.current) {
+        const conflicts = await api.exportConflicts(o, target, fmt);
         if (conflicts.length && !(await confirmAsk("같은 이름의 파일이 있습니다. 덮어쓸까요?", "덮어쓰기"))) {
           setProgress(null);
           return;
@@ -199,10 +203,9 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
       // 최소값은 1~100 (비우면 기본값)
       const pct = (v: number, def: number) => Math.max(1, Math.min(100, Math.round(v) || def));
       const mins = { minQuality: pct(minQuality, 25), minFps: pct(minFps, 10), minResize: pct(minResize, 25) };
-      await applyFmt();
       const result = fitting
-        ? await api.exportProjectFit(o, { targetBytes: safeTarget * 1_000_000, allowQuality, allowFps, allowResize, ...mins }, target)
-        : await api.exportProject(o, target);
+        ? await api.exportProjectFit(o, { targetBytes: safeTarget * 1_000_000, allowQuality, allowFps, allowResize, ...mins }, target, fmt)
+        : await api.exportProject(o, target, fmt);
       setDone(result);
       onSaved();
       // 이번에 고른 옵션을 다음 저장의 기본값으로
@@ -218,7 +221,9 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
                 : format === "avif"
                   ? { avifQuality: o.quality }
                   : {};
-      await api.setSettings({
+      // 단축키 등록만 실패해도 오류가 오지만 설정은 저장된다. 저장을 마친 화면에 그 오류를 띄우지 않는다.
+      await api
+        .setSettings({
         ...settings,
         ...fmt,
         ...q,
@@ -238,12 +243,14 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
         skipSimilarTimeLimitMs: o.skipSimilarTimeLimitMs ?? settings.skipSimilarTimeLimitMs,
         resizePercent: o.resizePercent,
         embedProgress: progressBar,
-      });
+        })
+        .catch(() => {});
     } catch (e) {
       setError(errText(e));
       setProgress(null);
     } finally {
       un();
+      setSaving(false);
     }
   };
 
@@ -636,14 +643,21 @@ export default function SaveDialog({ settings, frames, onClose, onSaved, onDelet
             disabled={working}
             onClick={async () => {
               const p = await api.pickSavePath(path, FORMAT_EXT[format]);
-              if (p) setPath(p);
+              if (p) {
+                confirmedPath.current = p;
+                setPath(p);
+              }
             }}
           >
             찾아보기…
           </button>
-          <button onClick={onClose} disabled={working}>
-            취소
-          </button>
+          {working ? (
+            <button onClick={() => api.cancelExport()} title="저장을 멈춥니다. 원래 있던 파일은 그대로 남습니다.">
+              저장 취소
+            </button>
+          ) : (
+            <button onClick={onClose}>취소</button>
+          )}
           <button className="primary" onClick={save} disabled={working || !path || (needsFfmpeg && !ffmpeg)}>
             {working ? "저장 중…" : fitting ? "용량에 맞춰 저장" : "저장"}
           </button>

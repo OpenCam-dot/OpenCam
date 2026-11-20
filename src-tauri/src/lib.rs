@@ -276,6 +276,9 @@ fn virtual_desktop() -> CmdResult<Rect> {
 fn begin_area_selection(app: AppHandle, window: WebviewWindow, state: State<AppState>) -> CmdResult<()> {
     if window.label() != "recorder" { return Err("녹화 창에서만 영역을 선택할 수 있습니다".into()); }
     if state.recorder.lock().is_some() { return Err("녹화 중에는 영역을 선택할 수 없습니다".into()); }
+    // 녹화를 마무리하는 동안(MP4 마무리 1~3초)에도 막는다. 이때 선택 창을 띄우면 곧 편집 창이 뜨면서
+    // 화면 전체를 덮는 투명한 선택 창이 남을 수 있다.
+    if state.finishing.load(Ordering::SeqCst) { return Err("녹화를 마무리하는 중입니다. 잠시 뒤에 다시 해 주세요".into()); }
     let r = virtual_desktop()?;
     let selector = app.get_webview_window("selector").ok_or("영역 선택 창이 없습니다")?;
     let recorder = recorder_window(&app)?;
@@ -677,9 +680,11 @@ fn set_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) 
     if let Ok(r) = recorder_window(&app) {
         let _ = r.set_always_on_top(on_top);
     }
-    register_hotkeys(&app)?;
+    // 단축키 등록이 실패해도 설정은 이미 바뀌었으므로 다른 창에 먼저 알린다.
+    // 알리지 않으면 다른 창이 옛 설정을 들고 있다가 통째로 저장해 방금 바꾼 값을 되돌렸다.
+    let hotkeys = register_hotkeys(&app);
     let _ = app.emit("settings-changed", ());
-    Ok(())
+    hotkeys
 }
 
 fn register_hotkeys(app: &AppHandle) -> CmdResult<()> {
@@ -911,7 +916,12 @@ async fn edit(app: AppHandle, op: EditOp) -> CmdResult<ProjectView> {
             EditOp::Transition { sel, kind, ms } => p.transition(&sel, kind, ms),
             EditOp::Zoom { start, zoom } => p.zoom_fx(start, &zoom),
             EditOp::Summarize { options } => p.summarize(options),
-            EditOp::Upscale { factor } => p.upscale(factor),
+            EditOp::Upscale { factor } => {
+                let max = state.settings.lock().max_edit_bytes();
+                if let Err(e) = p.upscale(factor, max) {
+                    message = Some(e);
+                }
+            }
         }
         view(&p, selection, message)
     })
@@ -920,9 +930,12 @@ async fn edit(app: AppHandle, op: EditOp) -> CmdResult<ProjectView> {
 }
 
 /// 바깥쪽 투명 테두리를 걷어낸 영역 (자르기의 "자동 맞춤")
-#[tauri::command]
-fn trim_bounds(state: State<AppState>) -> Option<(u32, u32, u32, u32)> {
-    state.project.lock().trim_bounds()
+// 메인 스레드가 아닌 곳에서 돌리고, 프로젝트 잠금은 프레임 목록을 복사하는 동안만 잡는다.
+// 큰 녹화에서는 모든 프레임을 풀어 보느라 오래 걸려, 그동안 창이 "응답 없음"이 되고 다른 명령도 기다렸다.
+#[tauri::command(async)]
+fn trim_bounds(app: AppHandle) -> Option<(u32, u32, u32, u32)> {
+    let frames = app.state::<AppState>().project.lock().frames.clone();
+    Project::bounds_of(&frames)
 }
 
 // ---------- 저장 ----------
@@ -934,7 +947,7 @@ fn default_save_path(state: State<AppState>, ext: String) -> String {
     export::unique_path(Path::new(&s.output_dir), &name, &ext).to_string_lossy().into_owned()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_save_path(app: AppHandle, current: String, ext: String) -> Option<String> {
     let cur = PathBuf::from(&current);
     let mut d = app.dialog().file().add_filter(ext.to_uppercase(), &[&ext]);
@@ -947,7 +960,7 @@ fn pick_save_path(app: AppHandle, current: String, ext: String) -> Option<String
     d.blocking_save_file()?.into_path().ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_folder(app: AppHandle, current: String) -> Option<String> {
     app.dialog()
         .file()
@@ -972,17 +985,51 @@ struct ExportResult {
 }
 
 /// 저장에 쓸 프레임 목록과 설정을 복사해 온다 (픽셀은 함께 쓰므로 복사가 싸다). 잠금은 바로 푼다.
-fn snapshot(app: &AppHandle) -> (Vec<frame::Frame>, Settings) {
+/// 저장 창에서 이번 저장에만 쓰는 설정 값들 (형식별 옵션). 설정 파일은 바꾸지 않는다.
+type SettingOverrides = Option<serde_json::Map<String, serde_json::Value>>;
+
+/// 저장에 쓸 프레임과 설정, 그리고 그때의 편집 번호(저장하는 동안 편집했는지 알아보려고)
+fn snapshot(app: &AppHandle, fmt: SettingOverrides) -> (Vec<frame::Frame>, Settings, u64) {
     let state = app.state::<AppState>();
-    let frames = state.project.lock().frames.clone();
+    let (frames, revision) = {
+        let p = state.project.lock();
+        (p.frames.clone(), p.revision)
+    };
     let s = state.settings.lock().clone();
-    (frames, s)
+    (frames, with_overrides(s, fmt), revision)
+}
+
+/// 설정에 저장 창의 값을 덮어쓴 사본. 모르는 이름이나 틀린 값이 섞여 있으면 원래 설정 그대로.
+fn with_overrides(s: Settings, fmt: SettingOverrides) -> Settings {
+    let Some(fmt) = fmt else { return s };
+    let Ok(serde_json::Value::Object(mut all)) = serde_json::to_value(&s) else { return s };
+    for (k, v) in fmt {
+        if all.contains_key(&k) {
+            all.insert(k, v);
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(all)).unwrap_or(s)
+}
+
+/// 저장이 끝난 뒤 "저장 안 한 변경 없음"으로 표시한다. 저장하는 동안 편집했으면 그대로 둔다.
+fn mark_saved(app: &AppHandle, revision: u64) {
+    let state = app.state::<AppState>();
+    let mut p = state.project.lock();
+    if p.revision == revision {
+        p.dirty = false;
+    }
+}
+
+/// 진행 중인 저장을 멈춘다 (저장 창의 "취소")
+#[tauri::command]
+fn cancel_export() {
+    export::set_cancel(true);
 }
 
 /// 이번 저장으로 덮어쓰게 될 파일을 찾는다.
 #[tauri::command]
-async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String) -> CmdResult<Vec<PathBuf>> {
-    let (frames, s) = snapshot(&app);
+async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String, fmt: SettingOverrides) -> CmdResult<Vec<PathBuf>> {
+    let (frames, s, _) = snapshot(&app, fmt);
     tauri::async_runtime::spawn_blocking(move || {
         export::planned_paths(&frames, Path::new(&path), &opts, &s).into_iter().filter(|p| p.exists()).collect()
     })
@@ -992,39 +1039,50 @@ async fn export_conflicts(app: AppHandle, opts: ExportOptions, path: String) -> 
 
 /// 저장한 파일 목록과 전체 크기를 돌려준다.
 #[tauri::command]
-async fn export_project(app: AppHandle, opts: ExportOptions, path: String) -> CmdResult<ExportResult> {
-    let (frames, s) = snapshot(&app);
+async fn export_project(app: AppHandle, opts: ExportOptions, path: String, fmt: SettingOverrides) -> CmdResult<ExportResult> {
+    let (frames, s, revision) = snapshot(&app, fmt);
     let h = app.clone();
-    let paths = tauri::async_runtime::spawn_blocking(move || {
+    export::set_cancel(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         export::export(&frames, Path::new(&path), &opts, &s, &|progress, msg| {
             let _ = h.emit("export-progress", ExportProgress { progress, message: msg.into() });
         })
     })
-    .await
-    .map_err(err)?
-    .map_err(|e| format!("{e:#}"))?;
+    .await;
+    export::set_cancel(false);
+    let paths = result.map_err(err)?.map_err(|e| format!("{e:#}"))?;
     let size = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-    app.state::<AppState>().project.lock().dirty = false;
+    mark_saved(&app, revision);
     Ok(ExportResult { paths, size, fit: None })
 }
 
 #[tauri::command]
-async fn export_project_fit(app: AppHandle, opts: ExportOptions, fit: export::FitOptions, path: String) -> CmdResult<ExportResult> {
-    let (frames, s) = snapshot(&app);
+async fn export_project_fit(
+    app: AppHandle,
+    opts: ExportOptions,
+    fit: export::FitOptions,
+    path: String,
+    fmt: SettingOverrides,
+) -> CmdResult<ExportResult> {
+    let (frames, s, revision) = snapshot(&app, fmt);
     let h = app.clone();
-    let (paths, fit) = tauri::async_runtime::spawn_blocking(move || {
+    export::set_cancel(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
         export::export_fit(&frames, Path::new(&path), &opts, &fit, &s, &|progress, msg| {
             let _ = h.emit("export-progress", ExportProgress { progress, message: msg.into() });
         })
-    }).await.map_err(err)?.map_err(|e| format!("{e:#}"))?;
+    })
+    .await;
+    export::set_cancel(false);
+    let (paths, fit) = result.map_err(err)?.map_err(|e| format!("{e:#}"))?;
     let size = paths.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
-    app.state::<AppState>().project.lock().dirty = false;
+    mark_saved(&app, revision);
     Ok(ExportResult { paths, size, fit: Some(fit) })
 }
 
 #[tauri::command]
-async fn estimate_size(app: AppHandle, opts: ExportOptions) -> CmdResult<u64> {
-    let (frames, s) = snapshot(&app);
+async fn estimate_size(app: AppHandle, opts: ExportOptions, fmt: SettingOverrides) -> CmdResult<u64> {
+    let (frames, s, _) = snapshot(&app, fmt);
     tauri::async_runtime::spawn_blocking(move || export::estimate_size(&frames, &opts, &s))
         .await
         .map_err(err)?
@@ -1041,10 +1099,32 @@ fn reveal_file(path: String) -> CmdResult<()> {
     tauri_plugin_opener::reveal_item_in_dir(path).map_err(err)
 }
 
+/// 파일 관리 명령(지우기·이름 바꾸기·미리보기)이 다뤄도 되는 파일인지 확인한다:
+/// 전체 경로로 적힌, 이 프로그램이 다루는 그림·동영상 파일 하나.
+/// 화면 쪽이 잘못된 경로를 보내도 폴더나 다른 종류의 파일을 지우거나 읽지 않게 한다.
+/// (상대 경로를 휴지통 함수에 넘기면 휴지통을 거치지 않고 바로 지워질 수 있고, `*`는 여러 파일로 풀린다.)
+fn managed_file(path: &str) -> CmdResult<PathBuf> {
+    let p = PathBuf::from(path);
+    let ext = import::ext_of(&p);
+    let media = import::IMAGE_EXTS.contains(&ext.as_str()) || import::VIDEO_EXTS.contains(&ext.as_str());
+    if !p.is_absolute() || path.contains(['*', '?', '\0']) || !media {
+        return Err("다룰 수 없는 파일입니다 (그림·동영상 파일의 전체 경로만 됩니다)".into());
+    }
+    if !p.is_file() {
+        return Err("파일이 없습니다".into());
+    }
+    Ok(p)
+}
+
 /// 저장한 파일 지우기 (설정에 따라 휴지통으로)
 #[tauri::command]
 fn delete_file(state: State<AppState>, path: String) -> CmdResult<()> {
-    if state.settings.lock().delete_to_recycle_bin { recycle(&path) } else { std::fs::remove_file(&path).map_err(err) }
+    let file = managed_file(&path)?;
+    if state.settings.lock().delete_to_recycle_bin {
+        recycle(&file.to_string_lossy())
+    } else {
+        std::fs::remove_file(&file).map_err(err)
+    }
 }
 
 #[cfg(windows)]
@@ -1160,7 +1240,7 @@ async fn filter_preview(app: AppHandle, id: u64, filters: Vec<Filter>) -> CmdRes
 
 // ---------- 열기 ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_open_files(app: AppHandle) -> Option<Vec<String>> {
     let all: Vec<&str> = import::IMAGE_EXTS.iter().chain(import::VIDEO_EXTS).copied().collect();
     let picked = app
@@ -1224,7 +1304,11 @@ async fn make_collage(
     options: collage::CollageOptions,
 ) -> CmdResult<ProjectView> {
     let max = memory_limit(&app);
-    let current = if use_current { app.state::<AppState>().project.lock().frames.clone() } else { vec![] };
+    let (current, revision) = {
+        let state = app.state::<AppState>();
+        let p = state.project.lock();
+        (if use_current { p.frames.clone() } else { vec![] }, p.revision)
+    };
     let progress = import_progress(&app);
     let frames = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<Vec<frame::Frame>> {
         let mut clips = vec![];
@@ -1243,11 +1327,22 @@ async fn make_collage(
             None => None,
         };
         progress(0.6, "콜라주 만드는 중");
-        collage::make(&clips, &options, bg)
+        collage::make(&clips, &options, bg, max)
     })
     .await
     .map_err(err)?
     .map_err(|e| format!("{e:#}"))?;
+    if use_current {
+        // 지금 편집 중인 영상을 넣었으면 새로 여는 것이 아니라 편집 한 번으로 친다.
+        // 새로 열면 되돌리기 기록이 지워져 원래 영상으로 돌아갈 수 없었다.
+        let state = app.state::<AppState>();
+        let mut p = state.project.lock();
+        if p.revision != revision {
+            return Err("콜라주를 만드는 동안 편집 내용이 바뀌어 적용하지 않았습니다. 다시 만들어 주세요".into());
+        }
+        p.replace(frames);
+        return Ok(view(&p, Some(vec![]), None));
+    }
     Ok(start_editing(&app, import::Loaded { frames, warning: None, memory_limited: false }, true))
 }
 
@@ -1263,7 +1358,7 @@ struct FileEntry {
 }
 
 /// 저장 폴더의 움짤·동영상·이미지 목록
-#[tauri::command]
+#[tauri::command(async)]
 fn list_files(dir: String) -> CmdResult<Vec<FileEntry>> {
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
@@ -1306,7 +1401,7 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
     if new_name.is_empty() || new_name.chars().any(|c| BAD.contains(c)) {
         return Err("파일 이름에 쓸 수 없는 글자가 있습니다 (\\ / : * ? \" < > |)".into());
     }
-    let old = PathBuf::from(&path);
+    let old = managed_file(&path)?;
     let mut name = new_name.to_string();
     let typed = import::ext_of(std::path::Path::new(&name));
     if !(import::IMAGE_EXTS.contains(&typed.as_str()) || import::VIDEO_EXTS.contains(&typed.as_str()))
@@ -1315,7 +1410,11 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
         name = format!("{name}.{}", ext.to_string_lossy());
     }
     let new = old.with_file_name(name);
-    if new.exists() {
+    // Windows는 대소문자를 가리지 않아 a.gif → A.gif는 "이미 있는 파일"로 보인다. 같은 파일이면 그대로 바꾼다.
+    // (폴더는 같으므로 파일 이름만 견준다. 경로 전체를 글자로 견주면 / 와 \ 가 섞였을 때 다르게 보인다.)
+    let lower = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    let same_file = lower(&new) == lower(&old);
+    if !same_file && new.exists() {
         return Err("같은 이름의 파일이 이미 있습니다".into());
     }
     std::fs::rename(&old, &new).map_err(err)?;
@@ -1326,6 +1425,7 @@ fn rename_file(path: String, new_name: String) -> CmdResult<String> {
 #[tauri::command]
 async fn file_bytes(path: String) -> CmdResult<tauri::ipc::Response> {
     tauri::async_runtime::spawn_blocking(move || {
+        let path = managed_file(&path)?;
         let len = std::fs::metadata(&path).map_err(err)?.len();
         if len > 100 * 1024 * 1024 {
             return Err("파일이 너무 커서 미리 볼 수 없습니다".to_string());
@@ -1432,7 +1532,7 @@ async fn export_frames(
 }
 
 /// 저장 대화상자 (형식 목록을 받아서)
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_save_file(app: AppHandle, current: String, filters: Vec<(String, Vec<String>)>) -> Option<String> {
     let cur = PathBuf::from(&current);
     let mut d = app.dialog().file();
@@ -1450,7 +1550,7 @@ fn pick_save_file(app: AppHandle, current: String, filters: Vec<(String, Vec<Str
 }
 
 /// 파일 하나 고르기
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_file(app: AppHandle, filters: Vec<(String, Vec<String>)>) -> Option<String> {
     let mut d = app.dialog().file();
     for (name, exts) in &filters {
@@ -1541,6 +1641,19 @@ fn autosave_loop(app: AppHandle) {
             (p.revision, p.frames.clone())
         };
         let enabled = state.settings.lock().auto_recovery;
+        // 켤 때 복구 목록으로 옮기지 못한 지난 작업이 아직 여기 있으면(디스크 가득 참 등) 다시 옮겨 보고,
+        // 그래도 안 되면 건드리지 않는다. 그냥 두면 여기서 지우거나 덮어써서 복구할 작업이 사라졌다.
+        if recovery::holds_leftover(&dir) {
+            recovery::adopt_leftover(&recovery::root());
+        }
+        if recovery::holds_leftover(&dir) {
+            if !warned {
+                warned = true;
+                let msg = "지난번에 남은 작업을 복구 목록으로 옮기지 못해 작업 자동 저장을 멈췄습니다 (디스크 공간을 확인해 주세요)";
+                let _ = app.emit("notice", msg.to_string());
+            }
+            continue;
+        }
         if frames.is_empty() || !enabled {
             recovery::clear(&dir);
         } else if !recovery::room_for(&dir, &frames, AUTOSAVE_MIN_FREE) {
@@ -1612,7 +1725,14 @@ async fn recovery_open(app: AppHandle, id: String) -> CmdResult<ProjectView> {
             return Ok(v); // 프로그램을 끝내는 중
         }
         let frames = state.project.lock().frames.clone();
+        if frames.is_empty() {
+            // 그사이 녹화 틀로 돌아가 편집 내용이 비었다: 복구할 작업을 지우지 않고 목록에 남겨 둔다
+            return Ok(v);
+        }
         let cur = recovery::current(&root);
+        if recovery::holds_leftover(&cur) {
+            return Ok(v);
+        }
         if !state.settings.lock().auto_recovery
             || (recovery::room_for(&cur, &frames, AUTOSAVE_MIN_FREE)
                 && recovery::save(&cur, &frames, &state.recovery_stop).is_ok())
@@ -1853,13 +1973,23 @@ enum OverlayKind {
     Insert,
 }
 
+/// 덧씌우기 본문을 정보(JSON 글)와 픽셀로 나눈다. 본문은 [정보 길이 4바이트][정보][픽셀] 순서다.
+/// 정보를 요청 머리말(헤더)에 넣으면, 적용할 프레임이 수천 장이거나 레이어가 많을 때 머리말 크기 한도를 넘는다.
+fn split_overlay_body(body: &[u8]) -> CmdResult<(&str, &[u8])> {
+    let bad = || "덧씌우기 정보가 없습니다".to_string();
+    let len = u32::from_le_bytes(body.get(..4).ok_or_else(bad)?.try_into().map_err(|_| bad())?) as usize;
+    let end = 4usize.checked_add(len).filter(|&e| e <= body.len()).ok_or_else(bad)?;
+    let raw = std::str::from_utf8(&body[4..end]).map_err(|_| bad())?;
+    Ok((raw, &body[end..]))
+}
+
 /// 그리기·텍스트·이미지 덧씌우기. 큰 픽셀 데이터를 JSON 없이 그대로 받는다.
 #[tauri::command]
 async fn apply_overlay(app: AppHandle, request: tauri::ipc::Request<'_>) -> CmdResult<ProjectView> {
-    let tauri::ipc::InvokeBody::Raw(rgba) = request.body() else {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
         return Err("그림 데이터가 없습니다".into());
     };
-    let raw = request.headers().get("x-overlay").and_then(|v| v.to_str().ok()).ok_or("덧씌우기 정보가 없습니다")?;
+    let (raw, rgba) = split_overlay_body(body)?;
     // 하나면 객체, 여러 개(레이어)면 배열. 픽셀은 순서대로 이어 붙어 온다.
     let metas: Vec<OverlayMeta> = match serde_json::from_str::<Vec<OverlayMeta>>(raw) {
         Ok(v) => v,
@@ -2062,6 +2192,7 @@ pub fn run() {
             append_files,
             new_blank,
             make_collage,
+            cancel_export,
             list_files,
             rename_file,
             file_bytes,
@@ -2082,6 +2213,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_dialog_overrides_change_only_the_copy() {
+        let s = Settings::default();
+        let mut fmt = serde_json::Map::new();
+        fmt.insert("webpLossless".into(), serde_json::Value::Bool(!s.webp_lossless));
+        fmt.insert("없는이름".into(), serde_json::Value::Bool(true));
+        let changed = with_overrides(s.clone(), Some(fmt));
+        assert_eq!(changed.webp_lossless, !s.webp_lossless);
+        assert_eq!(changed.fps, s.fps);
+        // 값의 종류가 틀리면 원래 설정 그대로
+        let mut bad = serde_json::Map::new();
+        bad.insert("webpLossless".into(), serde_json::Value::String("예".into()));
+        assert_eq!(with_overrides(s.clone(), Some(bad)).webp_lossless, s.webp_lossless);
+    }
 
     #[test]
     fn frame_request_does_not_block_parallel_edit() {
@@ -2338,8 +2484,19 @@ mod tests {
         assert!(rename_file(b.clone(), "a/b".into()).is_err());
         std::fs::write(dir.join("c.gif"), b"y").unwrap();
         assert!(rename_file(b.clone(), "c".into()).is_err());
-        // 목록에는 지원하는 파일만
+        // 대소문자만 바꾸는 것은 된다 (Windows에서는 같은 파일이라 "이미 있음"으로 보였다)
+        let upper = rename_file(b.clone(), "새 이름.GIF".into()).unwrap();
+        assert!(upper.ends_with("새 이름.GIF"));
+        let b = rename_file(upper, "새 이름.gif".into()).unwrap();
+        // 그림·동영상이 아닌 파일, 폴더, 상대 경로, 별표가 든 경로는 다루지 않는다
         std::fs::write(dir.join("memo.txt"), b"z").unwrap();
+        assert!(managed_file(&dir.join("memo.txt").to_string_lossy()).is_err());
+        assert!(managed_file(&dir.to_string_lossy()).is_err());
+        assert!(managed_file("a.gif").is_err());
+        assert!(managed_file(&dir.join("*.gif").to_string_lossy()).is_err());
+        assert!(managed_file(&b).is_ok());
+        assert!(rename_file(dir.join("memo.txt").to_string_lossy().into_owned(), "x".into()).is_err());
+        // 목록에는 지원하는 파일만
         let names: Vec<String> =
             list_files(dir.to_string_lossy().into_owned()).unwrap().into_iter().map(|f| f.name).collect();
         assert_eq!(names.len(), 2);

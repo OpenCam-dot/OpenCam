@@ -53,10 +53,9 @@ export default function CropView({ frame, scale, onApply, onCancel, onError }: P
   };
 
   /** 고정점 a에서 p까지의 사각형 (비율 고정이면 맞춘다) */
-  const span = (ax: number, ay: number, px: number, py: number): Rect => {
+  const span = (ax: number, ay: number, px: number, py: number, r = RATIOS[ratio]): Rect => {
     let w = Math.abs(px - ax);
     let h = Math.abs(py - ay);
-    const r = RATIOS[ratio];
     if (r) {
       if (w / Math.max(h, 1e-6) > r) w = h * r;
       else h = w / r;
@@ -104,6 +103,8 @@ export default function CropView({ frame, scale, onApply, onCancel, onError }: P
     const onKey = (e: KeyboardEvent) => {
       // 위에 확인·설정 같은 대화상자가 떠 있으면 그 창의 키다 (Esc·Enter가 도구까지 닫거나 적용하지 않게)
       if (isModalOpen()) return;
+      // 입력칸·버튼·고르기 칸에 포커스가 있으면 그쪽의 키다 ("취소"에서 Enter를 쳐도 적용되던 것을 막는다)
+      if (["INPUT", "BUTTON", "SELECT", "TEXTAREA"].includes((e.target as HTMLElement).tagName) && e.key === "Enter") return;
       if ((e.target as HTMLElement).tagName === "INPUT") return;
       if (e.key === "Enter" && !full) onApply(rect);
       else if (e.key === "Escape") onCancel();
@@ -181,7 +182,8 @@ export default function CropView({ frame, scale, onApply, onCancel, onError }: P
               onChange={(e) => {
                 setRatio(e.target.value);
                 const r = RATIOS[e.target.value];
-                if (r) setRect((c) => span(c.x, c.y, c.x + Math.min(c.w, c.h * r), c.y + Math.min(c.h, c.w / r)));
+                // 방금 고른 비율로 맞춘다 (화면의 ratio는 아직 예전 값이라 그대로 쓰면 예전 비율이 한 번 더 적용된다)
+                if (r) setRect((c) => span(c.x, c.y, c.x + c.w, c.y + c.h, r));
               }}
             >
               {Object.keys(RATIOS).map((k) => (

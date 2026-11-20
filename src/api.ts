@@ -410,10 +410,16 @@ export const api = {
   defaultSavePath: (ext: string) => invoke<string>("default_save_path", { ext }),
   pickSavePath: (current: string, ext: string) => invoke<string | null>("pick_save_path", { current, ext }),
   pickFolder: (current: string) => invoke<string | null>("pick_folder", { current }),
-  exportConflicts: (opts: ExportOptions, path: string) => invoke<string[]>("export_conflicts", { opts, path }),
-  exportProject: (opts: ExportOptions, path: string) => invoke<ExportResult>("export_project", { opts, path }),
-  exportProjectFit: (opts: ExportOptions, fit: FitOptions, path: string) => invoke<ExportResult>("export_project_fit", { opts, fit, path }),
-  estimateSize: (opts: ExportOptions) => invoke<number>("estimate_size", { opts }),
+  // fmt: 이번 저장에만 쓰는 설정 값(저장 창의 형식별 옵션). 설정 파일은 바꾸지 않는다.
+  exportConflicts: (opts: ExportOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<string[]>("export_conflicts", { opts, path, fmt }),
+  exportProject: (opts: ExportOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<ExportResult>("export_project", { opts, path, fmt }),
+  exportProjectFit: (opts: ExportOptions, fit: FitOptions, path: string, fmt?: Partial<Settings>) =>
+    invoke<ExportResult>("export_project_fit", { opts, fit, path, fmt }),
+  estimateSize: (opts: ExportOptions, fmt?: Partial<Settings>) => invoke<number>("estimate_size", { opts, fmt }),
+  /** 진행 중인 저장을 멈춘다 */
+  cancelExport: () => invoke<void>("cancel_export"),
   hasFfmpeg: () => invoke<boolean>("has_ffmpeg"),
   revealFile: (path: string) => invoke<void>("reveal_file", { path }),
   deleteFile: (path: string) => invoke<void>("delete_file", { path }),
@@ -458,22 +464,32 @@ export const api = {
   exportSettings: (path: string, settings: Settings) => invoke<void>("export_settings", { path, settings }),
   importSettings: (path: string) => invoke<Settings>("import_settings", { path }),
   /** 그림(RGBA 픽셀)을 프레임들에 덧씌운다. 픽셀은 JSON이 아니라 그대로 보낸다. */
-  applyOverlay: (rgba: Uint8Array, meta: OverlayMeta) =>
-    invoke<ProjectView>("apply_overlay", rgba, { headers: { "x-overlay": JSON.stringify(meta) } }),
+  applyOverlay: (rgba: Uint8Array, meta: OverlayMeta) => invoke<ProjectView>("apply_overlay", overlayBody(meta, [rgba])),
   /** 여러 개(레이어)를 한 번에: 픽셀은 순서대로 이어 붙여 보내고, 앞의 것이 아래에 깔린다 */
   applyOverlays: (items: { rgba: Uint8Array; meta: OverlayMeta }[]) => {
-    const total = items.reduce((n, it) => n + it.rgba.length, 0);
-    const body = new Uint8Array(total);
-    let at = 0;
-    for (const it of items) {
-      body.set(it.rgba, at);
-      at += it.rgba.length;
-    }
-    return invoke<ProjectView>("apply_overlay", body, {
-      headers: { "x-overlay": JSON.stringify(items.map((it) => it.meta)) },
-    });
+    return invoke<ProjectView>(
+      "apply_overlay",
+      overlayBody(
+        items.map((it) => it.meta),
+        items.map((it) => it.rgba),
+      ),
+    );
   },
 };
+
+/** 덧씌우기 본문: [정보 길이 4바이트][정보(JSON)][픽셀들]. 정보를 요청 머리말에 넣으면 프레임이 수천 장일 때 크기 한도를 넘는다. */
+function overlayBody(meta: unknown, pixels: Uint8Array[]): Uint8Array {
+  const info = new TextEncoder().encode(JSON.stringify(meta));
+  const body = new Uint8Array(4 + info.length + pixels.reduce((n, p) => n + p.length, 0));
+  new DataView(body.buffer).setUint32(0, info.length, true);
+  body.set(info, 4);
+  let at = 4 + info.length;
+  for (const p of pixels) {
+    body.set(p, at);
+    at += p.length;
+  }
+  return body;
+}
 
 const isWindows = navigator.userAgent.includes("Windows");
 

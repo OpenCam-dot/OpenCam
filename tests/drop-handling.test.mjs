@@ -134,9 +134,11 @@ test("GIF·WebP·PNG·APNG 하나는 대문자와 두 경로 구분자에서도 
 });
 
 test("다른 그림 하나나 여러 그림은 이미지 옵션으로 보내고 원래 목록을 바꾸지 않는다", () => {
-  for (const path of ["C:\\그림\\a.JPG", "/home/a.bmp", "a.tiff", "a.avif", "확장자없음", "a.unknown"]) {
+  for (const path of ["C:\\그림\\a.JPG", "/home/a.bmp", "a.tiff", "확장자없음", "a.unknown"]) {
     assert.deepEqual(classifyOpenPaths([path]), { kind: "images", paths: [path] });
   }
+  // AVIF는 ffmpeg로 읽으므로 동영상처럼 구간 가져오기로 보낸다 (저장한 AVIF를 다시 열 수 있게)
+  assert.deepEqual(classifyOpenPaths(["a.avif"]), { kind: "video", path: "a.avif" });
   const paths = Object.freeze(["b.gif", "a.PNG"]);
   assert.deepEqual(classifyOpenPaths(paths), { kind: "images", paths: ["a.PNG", "b.gif"] });
   assert.deepEqual(paths, ["b.gif", "a.PNG"]);

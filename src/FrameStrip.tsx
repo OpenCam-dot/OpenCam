@@ -92,6 +92,8 @@ export default function FrameStrip({ frames, current, sel, onSelect, threeDigit,
    * 썸네일 줄 위에서 끌기: 마우스 밑 프레임 번호가 바뀔 때마다 onIndex를 부르고, 가장자리로 끌면 그쪽으로 스크롤한다.
    * 손을 떼면 onUp. 파란 선 끌기와 범위 띠 끌기가 함께 쓴다.
    */
+  const dragStop = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragStop.current?.(), []);
   const startIndexDrag = (e: React.MouseEvent, onIndex: (i: number) => void, onUp?: () => void) => {
     const el = ref.current;
     if (!el || e.button !== 0) return;
@@ -107,13 +109,19 @@ export default function FrameStrip({ frames, current, sel, onSelect, threeDigit,
       last = i;
       onIndex(i);
     };
-    const up = () => {
+    const stop = () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
+      dragStop.current = null;
+    };
+    const up = () => {
+      stop();
       onUp?.();
     };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
+    // 끄는 도중에 썸네일 줄이 사라져도(다른 파일 열기 등) 마우스 감시가 남지 않게
+    dragStop.current = stop;
   };
 
   /** 지금 프레임 선(파란 선)을 끈다: 마우스 밑 프레임으로 옮긴다 (재생 위치 막대처럼) */

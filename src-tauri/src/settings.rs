@@ -255,6 +255,10 @@ pub fn save(s: &Settings) -> anyhow::Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(p, serde_json::to_string_pretty(s)?)?;
+    // 옆에 다 쓴 뒤 바꿔 넣는다. 바로 덮어쓰면 쓰는 도중에 프로그램이 꺼졌을 때 반쯤 쓴 파일이 남아
+    // 다음에 켤 때 모든 설정이 기본값으로 돌아갔다.
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(s)?)?;
+    std::fs::rename(&tmp, &p)?;
     Ok(())
 }

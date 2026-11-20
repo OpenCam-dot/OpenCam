@@ -86,6 +86,10 @@ export default function ZoomView({ frame, index, remainMs, scale, onApply, onCan
     if (done && a !== index) t.setCurrent(a);
   });
 
+  // 결과 보기를 끄면 받아 둔 그림 주소를 버린다. 그 주소는 곧 해제되므로, 다시 켰을 때 그대로 쓰면 깨진 그림이 보였다.
+  useEffect(() => {
+    if (!showResult) setPreview(null);
+  }, [showResult]);
   // 결과 미리보기 (가장 크게 확대된 순간)
   usePngPreview(showResult ? () => api.zoomPreview(frame.id, zoom) : null, setPreview, onError, [key, frame.id, showResult]);
 

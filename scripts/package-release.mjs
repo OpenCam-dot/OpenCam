@@ -10,6 +10,14 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const version = JSON.parse(readFileSync(join(root, "src-tauri", "tauri.conf.json"), "utf8")).version;
+// 버전은 세 곳에 적혀 있다. 하나라도 다르면(올리다 빠뜨림) 엉뚱한 번호로 묶이므로 여기서 멈춘다.
+const others = {
+  "package.json": JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
+  "src-tauri/Cargo.toml": /^version\s*=\s*"([^"]+)"/m.exec(readFileSync(join(root, "src-tauri", "Cargo.toml"), "utf8"))?.[1],
+};
+for (const [file, v] of Object.entries(others)) {
+  if (v !== version) throw new Error(`버전이 서로 다릅니다: tauri.conf.json은 ${version}, ${file}은 ${v}`);
+}
 const release = join(root, "src-tauri", "target", "release");
 const setupName = `OpenCam_${version}_x64-setup.exe`;
 const zipName = `OpenCam_${version}_x64_portable.zip`;

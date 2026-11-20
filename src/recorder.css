@@ -261,7 +261,9 @@ body,
   color: var(--bar-dim);
 }
 
+/* 줄어들지 않게 한다: 좁은 툴바에서 줄어들면 맨 끝의 적용 단추가 잘려 보이지 않았다 */
 .rec-size {
+  flex: none;
   display: inline-flex;
   align-items: center;
   gap: 3px;

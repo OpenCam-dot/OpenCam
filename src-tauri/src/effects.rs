@@ -244,27 +244,37 @@ pub fn apply_filter(px: &mut [u8], w: u32, h: u32, f: &Filter) {
             let r = region.unwrap_or(Region { x: 0, y: 0, w: wi, h: hi, ellipse: false });
             let mut out = px.to_vec();
             // 영역 왼쪽 위에 맞춰 칸을 나눈다
+            // 칸은 영역 안에서만 평균을 낸다 (오른쪽·아래 끝 칸에 영역 밖의 색이 섞이지 않게)
+            let (rx1, ry1) = ((r.x + r.w).min(wi), (r.y + r.h).min(hi));
             let mut by = r.y.max(0);
-            while by < (r.y + r.h).min(hi) {
+            while by < ry1 {
                 let mut bx = r.x.max(0);
-                while bx < (r.x + r.w).min(wi) {
-                    let (x1, y1) = ((bx + size).min(wi), (by + size).min(hi));
-                    let mut sum = [0u32; 4];
+                while bx < rx1 {
+                    let (x1, y1) = ((bx + size).min(rx1), (by + size).min(ry1));
+                    // 색은 불투명도만큼 무게를 둬서 평균한다 (투명한 픽셀에 남은 색이 섞이지 않게)
+                    let mut sum = [0u64; 4];
                     for y in by..y1 {
                         for x in bx..x1 {
                             let i = ((y * wi + x) * 4) as usize;
-                            for k in 0..4 {
-                                sum[k] += px[i + k] as u32;
+                            let a = px[i + 3] as u64;
+                            for k in 0..3 {
+                                sum[k] += px[i + k] as u64 * a;
                             }
+                            sum[3] += a;
                         }
                     }
-                    let n = ((x1 - bx) * (y1 - by)) as u32;
+                    let n = ((x1 - bx) * (y1 - by)) as u64;
+                    let mut avg = [0u8; 4];
+                    if sum[3] > 0 {
+                        for k in 0..3 {
+                            avg[k] = (sum[k] / sum[3]) as u8;
+                        }
+                        avg[3] = (sum[3] / n) as u8;
+                    }
                     for y in by..y1 {
                         for x in bx..x1 {
                             let i = ((y * wi + x) * 4) as usize;
-                            for k in 0..4 {
-                                out[i + k] = (sum[k] / n) as u8;
-                            }
+                            out[i..i + 4].copy_from_slice(&avg);
                         }
                     }
                     bx += size;
@@ -383,12 +393,34 @@ fn copy_in_region(px: &mut [u8], src: &[u8], w: i32, h: i32, region: Option<Regi
 }
 
 /// 상자 흐리기를 passes번 (3번이면 가우시안과 거의 같다)
+///
+/// 투명한 곳이 있으면 색에 불투명도를 곱해 놓고 흐린 뒤 되돌린다. 그냥 섞으면 투명한 픽셀에 남아 있는 색
+/// (크로마키로 지운 초록 등)이 가장자리로 번져 테두리가 생긴다.
 pub fn box_blur(px: &mut [u8], w: u32, h: u32, r: u32, passes: u32) {
     let (w, h, r) = (w as usize, h as usize, r as usize);
+    let has_alpha = px.chunks_exact(4).any(|p| p[3] != 255);
+    if has_alpha {
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
     let mut tmp = vec![0u8; px.len()];
     for _ in 0..passes {
         blur_line(px, &mut tmp, w, h, r, true);
         blur_line(&tmp, px, w, h, r, false);
+    }
+    if has_alpha {
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if a > 0 && a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
     }
 }
 
@@ -449,8 +481,9 @@ fn mix_into(px: &mut [u8], other: impl Fn(usize) -> u8, t: f32) {
 /// 전환 효과. tm: 이 프레임의 가운데 시각, total: 구간 전체 시간, ms: 효과 길이, first: 구간 첫 프레임 픽셀
 pub fn apply_transition(px: &mut [u8], kind: TransitionKind, tm: f32, total: f32, ms: f32, first: &[u8]) {
     let ms = ms.max(1.0);
-    let head = 1.0 - tm / ms; // 앞부분 효과 세기 (처음 1 → 0)
-    let tail = 1.0 - (total - tm) / ms; // 뒷부분 효과 세기 (0 → 끝 1)
+    // 효과 구간 밖에서는 0 (음수를 그대로 두면 플래시처럼 제곱할 때 다시 양수가 된다)
+    let head = (1.0 - tm / ms).max(0.0); // 앞부분 효과 세기 (처음 1 → 0)
+    let tail = (1.0 - (total - tm) / ms).max(0.0); // 뒷부분 효과 세기 (0 → 끝 1)
     match kind {
         TransitionKind::FadeInWhite => mix_into(px, |_| 255, head),
         TransitionKind::FadeInBlack => mix_into(px, |_| 0, head),
@@ -563,11 +596,12 @@ impl Overlay {
                 }
             }
         };
-        if self.anim_in != Anim::None && self.in_ms > 0.0 {
-            phase(self.anim_in, tm / self.in_ms);
+        let (in_ms, out_ms) = fit_anim_times(self.anim_in, self.in_ms, self.anim_out, self.out_ms, total);
+        if in_ms > 0.0 {
+            phase(self.anim_in, tm / in_ms);
         }
-        if self.anim_out != Anim::None && self.out_ms > 0.0 {
-            phase(self.anim_out, (total - tm) / self.out_ms);
+        if out_ms > 0.0 {
+            phase(self.anim_out, (total - tm) / out_ms);
         }
         if alpha <= 0.0 || scale <= 0.01 {
             return;
@@ -575,6 +609,20 @@ impl Overlay {
         let cx = self.x + self.w as f32 / 2.0 + dx;
         let cy = self.y + self.h as f32 / 2.0 + dy;
         composite_rotated(px, fw, fh, &self.rgba, self.w, self.h, cx, cy, scale, angle, alpha);
+    }
+}
+
+/// 등장·퇴장 시간을 구간 길이(total)에 맞춘다: 둘을 더한 것이 구간보다 길면 같은 비율로 줄인다.
+/// 줄이지 않으면 짧은 구간(프레임 한 장 등)에서는 등장이 끝나기도 전에 퇴장이 시작돼,
+/// 기본값(페이드 300ms씩)으로 한 장에 넣은 글자·그림이 거의 안 보였다. 효과가 없으면 0.
+fn fit_anim_times(anim_in: Anim, in_ms: f32, anim_out: Anim, out_ms: f32, total: f32) -> (f32, f32) {
+    let a = if anim_in != Anim::None { in_ms.max(0.0) } else { 0.0 };
+    let b = if anim_out != Anim::None { out_ms.max(0.0) } else { 0.0 };
+    if a + b > total && a + b > 0.0 {
+        let k = total.max(0.0) / (a + b);
+        (a * k, b * k)
+    } else {
+        (a, b)
     }
 }
 
@@ -847,6 +895,55 @@ mod tests {
         let mut p = img(1, 1, [0, 0, 0, 255]);
         apply_transition(&mut p, TransitionKind::FadeInWhite, 600.0, 1000.0, 500.0, &first);
         assert_eq!(p[0], 0);
+    }
+
+    #[test]
+    fn mosaic_stays_inside_its_region() {
+        // 왼쪽 3칸은 검정, 오른쪽 1칸은 흰색. 왼쪽 3칸만 모자이크(칸 크기 2)하면 흰색이 섞이면 안 된다
+        let mut p: Vec<u8> = [[0u8, 0, 0, 255], [0, 0, 0, 255], [0, 0, 0, 255], [255, 255, 255, 255]].concat();
+        let region = Region { x: 0, y: 0, w: 3, h: 1, ellipse: false };
+        apply_filter(&mut p, 4, 1, &Filter::Mosaic { size: 2, region: Some(region) });
+        assert_eq!(&p[8..11], &[0, 0, 0], "영역 끝 칸에 영역 밖의 색이 섞였다");
+        assert_eq!(&p[12..15], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn blur_and_mosaic_ignore_the_color_of_transparent_pixels() {
+        // 투명한 초록(크로마키로 지운 곳) 옆의 불투명한 빨강: 섞어도 초록이 번지지 않는다
+        let row: Vec<u8> = [[0u8, 255, 0, 0], [0, 255, 0, 0], [200, 0, 0, 255], [200, 0, 0, 255]].concat();
+        let mut blurred = row.clone();
+        box_blur(&mut blurred, 4, 1, 1, 1);
+        for p in blurred.chunks_exact(4).filter(|p| p[3] > 0) {
+            assert!(p[1] <= 2 && p[0] >= 190, "초록이 번졌다: {p:?}");
+        }
+        let mut mosaic = row.clone();
+        apply_filter(&mut mosaic, 4, 1, &Filter::Mosaic { size: 4, region: None });
+        assert_eq!(&mosaic[..4], &[200, 0, 0, 127]);
+    }
+
+    #[test]
+    fn overlay_animation_fits_into_a_short_span() {
+        // 프레임 한 장(100ms)에 페이드 300ms씩: 가운데 시각(50ms)에서 다 보여야 한다
+        let (a, b) = fit_anim_times(Anim::Fade, 300.0, Anim::Fade, 300.0, 100.0);
+        assert_eq!((a, b), (50.0, 50.0));
+        assert!(50.0 / a >= 1.0 && (100.0 - 50.0) / b >= 1.0);
+        // 넉넉한 구간에서는 그대로, 효과가 없으면 0
+        assert_eq!(fit_anim_times(Anim::Fade, 300.0, Anim::None, 300.0, 1000.0), (300.0, 0.0));
+        assert_eq!(fit_anim_times(Anim::Fade, 300.0, Anim::Fade, 100.0, 200.0), (150.0, 50.0));
+    }
+
+    #[test]
+    fn flash_stays_off_after_its_length() {
+        let first = img(1, 1, [0, 0, 0, 255]);
+        // 효과 길이(500ms)가 지난 뒤에는 어느 시각이든 원래 색 그대로
+        for tm in [500.0, 800.0, 1000.0, 1500.0, 3000.0] {
+            let mut p = img(1, 1, [0, 0, 0, 255]);
+            apply_transition(&mut p, TransitionKind::Flash, tm, 4000.0, 500.0, &first);
+            assert_eq!(p[0], 0, "tm={tm}");
+        }
+        let mut p = img(1, 1, [0, 0, 0, 255]);
+        apply_transition(&mut p, TransitionKind::Flash, 0.0, 4000.0, 500.0, &first);
+        assert_eq!(p[0], 255);
     }
 
     #[test]

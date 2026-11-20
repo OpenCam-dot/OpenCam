@@ -39,6 +39,8 @@ export async function checkForUpdate(manual = false) {
   }
   const version = latest.tag_name.replace(/^v/, "");
   if (await confirmAsk(`새 버전 ${version}이 나왔습니다. 받는 곳을 열까요?\n(지금 버전 ${current})`, "열기")) {
-    await openUrl(latest.html_url);
+    // 받은 주소가 이 프로그램의 저장소가 아니면(응답이 바뀌었거나 조작됨) 릴리스 목록을 연다
+    const url = typeof latest.html_url === "string" && latest.html_url.startsWith(`${REPO_URL}/`) ? latest.html_url : `${REPO_URL}/releases`;
+    await openUrl(url);
   }
 }

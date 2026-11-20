@@ -31,7 +31,8 @@ export function NewBlankDialog({
 }) {
   const [w, setW] = useState(640);
   const [h, setH] = useState(480);
-  const [fps, setFps] = useState(defaultFps);
+  // 빈 영상은 60 FPS까지 (기본 FPS 설정이 그보다 높아도 버튼이 잠기지 않게)
+  const [fps, setFps] = useState(Math.min(defaultFps, 60));
   const [sec, setSec] = useState(3);
   const [color, setColor] = useState("#ffffff");
   const [transparent, setTransparent] = useState(false);
@@ -333,7 +334,7 @@ export function ManageDialog({
   };
 
   return (
-    <Modal title="파일 관리" onClose={onClose} wide>
+    <Modal title="파일 관리" onClose={onClose} onOk={onClose} okText="닫기" hideCancel wide>
       <p className="hint">
         저장 폴더: {settings.outputDir} · {files.length}개
       </p>

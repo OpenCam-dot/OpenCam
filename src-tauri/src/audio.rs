@@ -131,11 +131,21 @@ impl AudioCapture {
 
 impl Drop for AudioCapture {
     fn drop(&mut self) {
-        // finish 없이 버려졌으면 (녹화를 시작하지 못함) 조용히 정리한다
+        // finish 없이 버려졌으면 (녹화를 시작하지 못함) 조용히 정리한다.
+        // 소리 장치가 응답하지 않아 버려진 경우에는 스레드가 언제 끝날지 모른다. 여기서 기다리면
+        // 녹화를 시작하던 쪽(녹화 잠금을 쥐고 있음)까지 멈춰 앱 전체가 얼어붙으므로, 기다림과
+        // 파일 지우기는 다른 스레드에 맡긴다.
         if let Some(t) = self.thread.take() {
             self.shared.stop.store(true, Ordering::SeqCst);
-            let _ = t.join();
-            let _ = std::fs::remove_file(&self.path);
+            let path = self.path.clone();
+            let cleanup = move || {
+                let _ = t.join();
+                let _ = std::fs::remove_file(&path);
+            };
+            if let Err(e) = std::thread::Builder::new().name("opencam-audio-cleanup".into()).spawn(cleanup) {
+                // 스레드를 못 만들면 기다리지 않고 놓아 둔다 (파일은 남을 수 있다)
+                eprintln!("소리 정리 스레드를 만들 수 없음: {e}");
+            }
         }
     }
 }
@@ -413,9 +423,11 @@ unsafe fn drain(s: &Session, mut f: impl FnMut(i64, &[u8], bool)) -> windows::co
             let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
             // 시각이 없거나 지금과 동떨어져 있으면 지금 시각에서 이 묶음 길이만큼 앞으로 본다
             let t = now();
-            let length = frames as i64 * TICKS / s.fmt.rate as i64;
-            let at = stamp as i64;
-            let unsure = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 || (t - at).abs() > 5 * TICKS;
+            let length = frames as i64 * TICKS / (s.fmt.rate as i64).max(1);
+            // 일부 가상 소리 장치는 엉뚱하게 큰 시각을 준다. i64로 못 옮기거나 지금과 동떨어지면 믿지 않는다
+            // (그냥 빼면 넘쳐서 프로그램이 꺼질 수 있다).
+            let at = i64::try_from(stamp).unwrap_or(i64::MAX);
+            let unsure = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 || t.abs_diff(at) > 5 * TICKS as u64;
             let bytes: &[u8] =
                 if silent { &[] } else { std::slice::from_raw_parts(data, frames as usize * s.fmt.block()) };
             f(if unsure { t - length } else { at }, bytes, silent);
@@ -463,8 +475,6 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
         let mut timeline = Timeline::default();
         let mut converted: Vec<u8> = vec![];
         let mut checked = Instant::now();
-        // 새 장치의 소리 빠르기가 달라 이어 받을 수 없게 됨
-        let mut gave_up = false;
         let mut write_failed = false;
 
         loop {
@@ -501,7 +511,7 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
             if stopping {
                 break;
             }
-            if !gave_up && checked.elapsed() >= Duration::from_secs(1) {
+            if checked.elapsed() >= Duration::from_secs(1) {
                 checked = Instant::now();
                 let changed = match &session {
                     None => true,
@@ -510,10 +520,9 @@ unsafe fn capture_loop(shared: &Shared, path: &Path, ready: mpsc::Sender<Result<
                 if changed {
                     match open(&en) {
                         Ok(new) if new.fmt.rate == rate => session = Some(new),
-                        Ok(_) => {
-                            session = None;
-                            gave_up = true;
-                        }
+                        // 새 장치는 소리 빠르기가 달라 이어 받을 수 없다. 그만두지 않고 계속 살핀다:
+                        // 이어폰을 잠깐 뺐다 꽂거나 원래 장치로 돌아오면 다시 받는다.
+                        Ok(_) => session = None,
                         // 지금은 장치가 없다. 조금 뒤에 다시 찾는다.
                         Err(_) => session = None,
                     }
@@ -715,6 +724,28 @@ mod tests {
             return;
         };
         drop(cap);
+        // 정리는 다른 스레드가 하므로 잠깐 기다린다
+        let t = Instant::now();
+        while path.exists() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!path.exists());
+    }
+
+    /// 소리 장치가 응답하지 않아 버려도, 버리는 쪽은 기다리지 않는다 (녹화 시작이 멈추지 않는다)
+    #[test]
+    fn dropping_a_stuck_capture_does_not_wait_for_it() {
+        let shared =
+            Arc::new(Shared { stop: AtomicBool::new(false), marks: Mutex::new(VecDeque::new()), total: Mutex::new(None) });
+        // 응답 없는 장치처럼 3초 동안 끝나지 않는 스레드
+        let thread = std::thread::spawn(|| -> Result<Captured> {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok((0, None))
+        });
+        let path = std::env::temp_dir().join(format!("opencam_audio_{}_stuck.tmp", std::process::id()));
+        let cap = AudioCapture { shared, thread: Some(thread), path };
+        let t = Instant::now();
+        drop(cap);
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
     }
 }
