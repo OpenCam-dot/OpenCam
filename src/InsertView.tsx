@@ -354,7 +354,21 @@ export default function InsertView({ frame, scale, onApply, onCancel, onError }:
   const fileRef = useRef<HTMLInputElement>(null);
 
   const sel = items.find((i) => i.id === selId) ?? null;
-  const rendered = useMemo(() => new Map(items.map((it) => [it.id, render(it)])), [items]);
+  // 개체 그림은 모양이 바뀔 때만 다시 그린다. 끌어 옮기는 동안에는 자리(cx, cy)만 바뀌는데,
+  // 그때마다 모든 개체를 다시 그리면 개체가 많을수록 끌기가 버벅였다.
+  const drawn = useRef(new Map<number, { look: string; image: HTMLImageElement | null; canvas: HTMLCanvasElement | null }>());
+  const rendered = useMemo(() => {
+    const next = new Map<number, { look: string; image: HTMLImageElement | null; canvas: HTMLCanvasElement | null }>();
+    for (const it of items) {
+      // 자리와 등장·퇴장 효과는 그림 모양과 상관없다
+      const { cx: _cx, cy: _cy, animIn: _in, animOut: _out, inMs: _inMs, outMs: _outMs, image, ...shape } = it;
+      const look = JSON.stringify(shape);
+      const old = drawn.current.get(it.id);
+      next.set(it.id, old && old.look === look && old.image === image ? old : { look, image, canvas: render(it) });
+    }
+    drawn.current = next;
+    return new Map([...next].map(([id, d]) => [id, d.canvas]));
+  }, [items]);
 
   const update = (patch: Partial<Item>) => {
     setTouched(true);
