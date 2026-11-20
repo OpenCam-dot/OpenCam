@@ -4,7 +4,7 @@
 다음 기능 후보는 [next-features.md](next-features.md), 개발할 때 알아 둘 것은 [AGENTS.md](../AGENTS.md).
 (마지막 정리: 2026-11-03, 용량에 맞춰 저장 만든 뒤)
 
-## 이번 작업: 검토 보고서의 문제 고치기 (2026-11-19~20, Claude Code, 브랜치 `fix/review-critical`, PR #20)
+## 이번 작업: 검토 보고서의 문제 고치기 (2026-11-19~20, Claude Code, PR #20, main에 합침, 릴리스는 아직)
 
 사용자가 `docs/project-review.md`(전체 검토 보고서, 저장소에 아직 안 올림)를 읽게 하고 "브랜치를 따로 열어 PR로 고쳐 보라"고 함. 보고서 "추천 수정 순서" 1단계 7가지를 고쳤다. cargo test 161개(새 테스트 5개)·노드 테스트 67개·tsc 통과.
 
